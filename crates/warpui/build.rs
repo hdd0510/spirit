@@ -134,6 +134,7 @@ fn compile_objc_lib() {
     println!("cargo:rustc-link-lib=framework=UniformTypeIdentifiers");
     println!("cargo:rustc-link-lib=framework=AVFoundation");
     println!("cargo:rustc-link-lib=framework=CoreMedia");
+    println!("cargo:rustc-link-lib=framework=Quartz");
     println!("cargo:rerun-if-changed=src/platform/mac/objc/video_view.m");
     println!("cargo:rustc-link-lib=framework=ServiceManagement");
     println!("cargo:rerun-if-changed=src/platform/mac/objc/app.h");

@@ -10,6 +10,10 @@ pub(crate) mod link_detection;
 pub mod links;
 pub mod openable_file_type;
 pub mod path;
+#[cfg(feature = "local_fs")]
+pub mod remote_document_sync;
+#[cfg(all(feature = "local_fs", target_os = "macos"))]
+pub mod remote_media_stream;
 pub mod repo_detection;
 pub mod time_format;
 pub mod tooltips;

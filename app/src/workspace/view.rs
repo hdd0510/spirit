@@ -4443,14 +4443,16 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         if path.is_file() {
-            if !cfg!(target_os = "macos") && crate::util::openable_file_type::is_video_file(&path) {
+            if !cfg!(target_os = "macos")
+                && crate::util::openable_file_type::is_native_preview_file(&path)
+            {
                 crate::util::video_player::open_video(path);
                 return;
             }
         }
 
         let target = if (crate::util::openable_file_type::is_supported_image_file(&path)
-            || crate::util::openable_file_type::is_video_file(&path))
+            || crate::util::openable_file_type::is_native_preview_file(&path))
             && !matches!(target, FileTarget::CodeEditor(_))
         {
             FileTarget::CodeEditor(EditorLayout::SplitPane)
@@ -4589,9 +4591,9 @@ impl Workspace {
                         #[cfg(feature = "local_fs")]
                         {
                             if let LocalOrRemotePath::Remote(remote_path) = location
-                                && (crate::util::openable_file_type::is_video_file(Path::new(
-                                    remote_path.path.as_str(),
-                                )) || crate::util::openable_file_type::is_supported_image_file(
+                                && (crate::util::openable_file_type::is_native_preview_file(
+                                    Path::new(remote_path.path.as_str()),
+                                ) || crate::util::openable_file_type::is_supported_image_file(
                                     Path::new(remote_path.path.as_str()),
                                 ))
                             {
@@ -4664,6 +4666,14 @@ impl Workspace {
         }
 
         let remote_file = remote_path.path.as_str().to_string();
+        #[cfg(target_os = "macos")]
+        if crate::util::video_player::plays_natively(Path::new(&remote_file))
+            && let Some(stream_url) =
+                crate::util::remote_media_stream::stream_url(socket_paths.clone(), &remote_file)
+        {
+            self.open_image_tab(stream_url, ctx);
+            return;
+        }
         let Some(file_name) = Path::new(&remote_file)
             .file_name()
             .map(|name| name.to_owned())
@@ -4671,19 +4681,20 @@ impl Workspace {
             return;
         };
         let display_name = file_name.to_string_lossy().into_owned();
-        let toast_id = format!("remote-media-download:{remote_file}");
-        if !self.remote_media_downloads.insert(remote_path.clone()) {
-            return;
-        }
-        self.toast_stack.update(ctx, |toast_stack, ctx| {
-            let toast = DismissibleToast::default(format!("Downloading {display_name}…"))
-                .with_object_id(toast_id.clone());
-            toast_stack.add_persistent_toast(toast, ctx);
-        });
-
+        let sync_sockets = socket_paths.clone();
+        let sync_remote_file = remote_file.clone();
         let local_dir = remote_media_cache_dir(&remote_path);
         let local_path = local_dir.join(&file_name);
         let partial_path = local_dir.join(format!("{display_name}.partial"));
+
+        if cfg!(target_os = "macos")
+            && crate::util::openable_file_type::is_document_file(&local_path)
+        {
+            self.open_image_tab(local_path.clone(), ctx);
+        }
+        if !self.remote_media_downloads.insert(remote_path.clone()) {
+            return;
+        }
 
         ctx.spawn(
             async move {
@@ -4716,11 +4727,15 @@ impl Workspace {
             },
             move |me, result, ctx| {
                 me.remote_media_downloads.remove(&remote_path);
-                me.toast_stack.update(ctx, |toast_stack, ctx| {
-                    toast_stack.dismiss_older_toasts(&toast_id, ctx);
-                });
                 match result {
                     Ok(local_path) => {
+                        if crate::util::openable_file_type::is_document_file(&local_path) {
+                            crate::util::remote_document_sync::upload_on_save(
+                                local_path.clone(),
+                                sync_sockets,
+                                sync_remote_file,
+                            );
+                        }
                         if cfg!(target_os = "macos")
                             || crate::util::openable_file_type::is_supported_image_file(&local_path)
                         {

@@ -61,6 +61,7 @@ use crate::tab::TAB_BAR_BORDER_HEIGHT;
 use crate::ui_components::blended_colors;
 use crate::ui_components::buttons::icon_button;
 use crate::util::path::{display_name_with_host, display_path_with_host};
+use crate::view_components::action_button::{ActionButton, ButtonSize, SecondaryTheme};
 use crate::view_components::{DismissibleToast, MarkdownToggleEvent, MarkdownToggleView};
 use crate::workspace::{ActiveSession, TabBarDropTargetData, ToastStack};
 
@@ -236,6 +237,7 @@ pub struct CodeView {
     markdown_mode_segmented_control: Option<ViewHandle<MarkdownToggleView>>,
     keep_open_when_empty: bool,
     videos: HashMap<PathBuf, VideoState>,
+    edit_externally_button: ViewHandle<ActionButton>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -249,7 +251,7 @@ fn is_local_video(location: &LocalOrRemotePath) -> bool {
     cfg!(target_os = "macos")
         && location
             .to_local_path()
-            .is_some_and(crate::util::openable_file_type::is_video_file)
+            .is_some_and(crate::util::openable_file_type::is_native_preview_file)
 }
 
 impl CodeView {
@@ -268,6 +270,11 @@ impl CodeView {
             markdown_mode_segmented_control: None,
             keep_open_when_empty: false,
             videos: HashMap::new(),
+            edit_externally_button: ctx.add_typed_action_view(|_| {
+                ActionButton::new("Edit in default app", SecondaryTheme)
+                    .with_size(ButtonSize::Small)
+                    .on_click(|ctx| ctx.dispatch_typed_action(CodeViewAction::OpenVideoExternally))
+            }),
         }
     }
 
@@ -464,7 +471,9 @@ impl CodeView {
         let Some(path) = location.to_local_path().map(Path::to_path_buf) else {
             return;
         };
-        if crate::util::video_player::plays_natively(&path) {
+        if crate::util::video_player::plays_natively(&path)
+            || crate::util::openable_file_type::is_document_file(&path)
+        {
             self.videos.insert(path.clone(), VideoState::Ready(path));
             return;
         }
@@ -485,16 +494,44 @@ impl CodeView {
     }
 
     fn render_video(&self, path: &Path, app: &AppContext) -> Box<dyn Element> {
-        let message = match self.videos.get(path) {
+        let message: std::borrow::Cow<'static, str> = match self.videos.get(path) {
+            Some(VideoState::Ready(_))
+                if crate::util::openable_file_type::is_document_file(path) && !path.exists() =>
+            {
+                format!(
+                    "Loading {}…",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                )
+                .into()
+            }
             Some(VideoState::Ready(playable)) => {
-                return Container::new(warpui::elements::Video::new(playable.clone()).finish())
+                let media = Container::new(warpui::elements::Video::new(playable.clone()).finish())
                     .with_uniform_padding(PADDING)
+                    .finish();
+                if !crate::util::openable_file_type::is_document_file(path) {
+                    return media;
+                }
+                return Flex::column()
+                    .with_child(
+                        Container::new(
+                            Flex::row()
+                                .with_main_axis_size(MainAxisSize::Max)
+                                .with_main_axis_alignment(MainAxisAlignment::End)
+                                .with_child(ChildView::new(&self.edit_externally_button).finish())
+                                .finish(),
+                        )
+                        .with_padding_top(PADDING)
+                        .with_horizontal_padding(PADDING)
+                        .finish(),
+                    )
+                    .with_child(Shrinkable::new(1., media).finish())
                     .finish();
             }
             Some(VideoState::Failed) => {
-                "This video can't be played here. Use \"Open in default app\" from the pane menu."
+                "This video can't be played here. Use \"Edit in default app\" from the pane menu."
+                    .into()
             }
-            Some(VideoState::Preparing) | None => "Preparing video…",
+            Some(VideoState::Preparing) | None => "Preparing video…".into(),
         };
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
@@ -704,7 +741,7 @@ impl CodeView {
         if let Some(tab) = self.tab_at(self.active_tab_index) {
             let is_image = tab.local_path().is_some_and(|path| {
                 crate::util::openable_file_type::is_supported_image_file(&path)
-                    || crate::util::openable_file_type::is_video_file(&path)
+                    || crate::util::openable_file_type::is_native_preview_file(&path)
             });
             if is_image {
                 ctx.focus_self();
@@ -2106,7 +2143,7 @@ impl CodeView {
 
             if active_location.is_some_and(is_local_video) {
                 items.push(
-                    MenuItemFields::new("Open in default app")
+                    MenuItemFields::new("Edit in default app")
                         .with_on_select_action(CodeViewAction::OpenVideoExternally)
                         .into_item(),
                 );
@@ -2281,7 +2318,11 @@ impl TypedActionView for CodeView {
                     .tab_at(self.active_tab_index)
                     .and_then(|tab| tab.local_path());
                 if let Some(path) = path {
-                    crate::util::video_player::open_video(path);
+                    if crate::util::openable_file_type::is_document_file(&path) {
+                        ctx.open_file_path(&path);
+                    } else {
+                        crate::util::video_player::open_video(path);
+                    }
                 }
             }
 

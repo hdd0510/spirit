@@ -7,6 +7,8 @@ mod bootstrapping;
 mod code_review;
 mod copy_current_path;
 mod ctrl_d;
+#[cfg(target_os = "macos")]
+mod document_preview;
 mod file_tree;
 mod goto_line;
 mod history;
@@ -49,6 +51,8 @@ pub use bootstrapping::*;
 pub use code_review::*;
 pub use copy_current_path::*;
 pub use ctrl_d::*;
+#[cfg(target_os = "macos")]
+pub use document_preview::*;
 pub use file_tree::*;
 use float_cmp::assert_approx_eq;
 pub use goto_line::*;

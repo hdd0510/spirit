@@ -1,6 +1,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Quartz/Quartz.h>
 #import <objc/runtime.h>
 
 static char kVideoViewsKey;
@@ -103,7 +104,9 @@ static NSString *formatVideoTime(double seconds) {
     self.layer.backgroundColor = NSColor.blackColor.CGColor;
     self.layer.masksToBounds = YES;
 
-    self.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:path]];
+    NSURL *url = [path hasPrefix:@"http://"] ? [NSURL URLWithString:path]
+                                             : [NSURL fileURLWithPath:path];
+    self.player = [AVPlayer playerWithURL:url];
     self.player.actionAtItemEnd = AVPlayerActionAtItemEndPause;
     self.videoLayer = [AVPlayerLayer playerLayerWithPlayer:self.player];
     self.videoLayer.videoGravity = AVLayerVideoGravityResizeAspect;
@@ -389,20 +392,89 @@ static NSString *formatVideoTime(double seconds) {
 
 @end
 
+static BOOL isVideoPath(NSString *path) {
+    if ([path hasPrefix:@"http://"]) return YES;
+    NSSet *videoExtensions = [NSSet setWithArray:@[
+        @"mp4", @"m4v", @"mov", @"mkv", @"webm", @"avi", @"wmv", @"flv", @"mpg", @"mpeg", @"ogv",
+        @"3gp"
+    ]];
+    return [videoExtensions containsObject:path.pathExtension.lowercaseString];
+}
+
+static NSDate *modificationDate(NSString *path) {
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+    return attributes.fileModificationDate ?: [NSDate distantPast];
+}
+
+@interface WarpDocumentView : NSView
+@property(nonatomic, retain) QLPreviewView *preview;
+@property(nonatomic, copy) NSString *documentPath;
+@property(nonatomic, retain) NSDate *shownModificationDate;
+- (instancetype)initWithPath:(NSString *)path;
+- (void)refreshIfChanged;
+- (void)closeVideo;
+@end
+
+@implementation WarpDocumentView
+
+- (instancetype)initWithPath:(NSString *)path {
+    self = [super initWithFrame:NSZeroRect];
+    if (!self) return nil;
+    self.documentPath = path;
+    self.wantsLayer = YES;
+    self.preview = [[[QLPreviewView alloc] initWithFrame:NSZeroRect
+                                                   style:QLPreviewViewStyleNormal] autorelease];
+    self.preview.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.preview.shouldCloseWithWindow = NO;
+    [self addSubview:self.preview];
+    self.shownModificationDate = modificationDate(path);
+    self.preview.previewItem = [NSURL fileURLWithPath:path];
+    return self;
+}
+
+- (void)setFrame:(NSRect)frame {
+    [super setFrame:frame];
+    self.preview.frame = self.bounds;
+}
+
+- (void)refreshIfChanged {
+    NSDate *current = modificationDate(self.documentPath);
+    if ([current isEqualToDate:self.shownModificationDate]) return;
+    self.shownModificationDate = current;
+    self.preview.previewItem = [NSURL fileURLWithPath:self.documentPath];
+    [self.preview refreshPreviewItem];
+}
+
+- (void)closeVideo {
+    [self.preview close];
+    [self removeFromSuperview];
+}
+
+- (void)dealloc {
+    [_preview release];
+    [_documentPath release];
+    [_shownModificationDate release];
+    [super dealloc];
+}
+
+@end
+
 BOOL warp_video_owns_event(NSWindow *window, NSEvent *event) {
     NSView *content = window.contentView;
     if (!content) return NO;
     NSPoint point = [content.superview convertPoint:event.locationInWindow fromView:nil];
     for (NSView *view = [content hitTest:point]; view && view != content; view = view.superview) {
-        if ([view isKindOfClass:[WarpVideoView class]]) return YES;
+        if ([view isKindOfClass:[WarpVideoView class]] ||
+            [view isKindOfClass:[WarpDocumentView class]]) {
+            return YES;
+        }
     }
     return NO;
 }
 
 void warp_sync_video_views(NSView *host, const char *const *paths, const CGRect *frames,
                            const BOOL *covered, NSUInteger count) {
-    NSMutableDictionary<NSString *, WarpVideoView *> *views =
-        objc_getAssociatedObject(host, &kVideoViewsKey);
+    NSMutableDictionary<NSString *, id> *views = objc_getAssociatedObject(host, &kVideoViewsKey);
     if (!views && count == 0) return;
     NSMutableDictionary<NSString *, NSDictionary *> *wanted = [NSMutableDictionary dictionary];
     for (NSUInteger i = 0; i < count; i++) {
@@ -417,12 +489,13 @@ void warp_sync_video_views(NSView *host, const char *const *paths, const CGRect 
             @"frame" : [NSValue valueWithRect:frames[i]],
             @"covered" : @(covered[i]),
             @"hostHeight" : @(NSHeight(host.bounds)),
+            @"modified" : isVideoPath(path) ? [NSDate distantPast] : modificationDate(path),
         };
     }
     if ([objc_getAssociatedObject(host, &kVideoWantedKey) isEqual:wanted]) return;
     objc_setAssociatedObject(host, &kVideoWantedKey, wanted, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     dispatch_async(dispatch_get_main_queue(), ^{
-      NSMutableDictionary<NSString *, WarpVideoView *> *current =
+      NSMutableDictionary<NSString *, id> *current =
           objc_getAssociatedObject(host, &kVideoViewsKey);
       if (!current) {
           current = [NSMutableDictionary dictionary];
@@ -436,11 +509,16 @@ void warp_sync_video_views(NSView *host, const char *const *paths, const CGRect 
       }
       for (NSString *key in wanted) {
           NSDictionary *info = wanted[key];
-          WarpVideoView *view = current[key];
+          NSView *view = current[key];
           if (!view) {
-              view = [[[WarpVideoView alloc] initWithPath:info[@"path"]] autorelease];
+              NSString *path = info[@"path"];
+              view = isVideoPath(path)
+                         ? (NSView *)[[[WarpVideoView alloc] initWithPath:path] autorelease]
+                         : (NSView *)[[[WarpDocumentView alloc] initWithPath:path] autorelease];
               current[key] = view;
               [host addSubview:view];
+          } else if ([view isKindOfClass:[WarpDocumentView class]]) {
+              [(WarpDocumentView *)view refreshIfChanged];
           }
           NSRect frame = [info[@"frame"] rectValue];
           frame.origin.y = NSHeight(host.bounds) - NSMaxY(frame);
