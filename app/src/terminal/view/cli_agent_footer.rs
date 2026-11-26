@@ -35,6 +35,7 @@ use crate::settings_view::{SettingsSection, cli_agent_settings_widget_id};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
 use crate::terminal::input::MenuPositioningProvider;
+use crate::terminal::input::slash_commands::agent_commands::opens_agent_panel;
 use crate::terminal::input::voice_input::VoiceInputButton;
 use crate::terminal::model::TerminalModel;
 use crate::terminal::model_events::ModelEventDispatcher;
@@ -552,8 +553,15 @@ impl View for CliAgentFooter {
             .with_run_spacing(spacing::UDI_ROW_RUN_SPACING)
             .finish();
 
+        let top_padding = if CLIAgentSessionsModel::as_ref(app).is_input_open(self.terminal_view_id)
+        {
+            FOOTER_VERTICAL_PADDING
+        } else {
+            0.
+        };
         Container::new(content)
-            .with_vertical_padding(FOOTER_VERTICAL_PADDING)
+            .with_padding_top(top_padding)
+            .with_padding_bottom(FOOTER_VERTICAL_PADDING)
             .finish()
     }
 }
@@ -732,11 +740,17 @@ impl TerminalView {
     }
 
     pub(super) fn open_cli_agent_rich_input(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.show_cli_agent_rich_input(ctx) {
+            self.focus_input_box(ctx);
+        }
+    }
+
+    pub(super) fn show_cli_agent_rich_input(&mut self, ctx: &mut ViewContext<Self>) -> bool {
         if !FeatureFlag::CLIAgentRichInput.is_enabled()
             || self.has_active_cli_agent_input_session(ctx)
             || self.cli_agent_footer.as_ref(ctx).cli_agent(ctx).is_none()
         {
-            return;
+            return false;
         }
 
         let view_id = self.view_id;
@@ -744,8 +758,8 @@ impl TerminalView {
             sessions_model.open_input(view_id, true, ctx);
         });
 
-        self.focus_input_box(ctx);
         ctx.notify();
+        true
     }
 
     pub(super) fn close_cli_agent_rich_input(&mut self, ctx: &mut ViewContext<Self>) {
@@ -821,13 +835,22 @@ impl TerminalView {
             .unwrap_or(CLIAgent::Unknown);
         let strategy = self.resolve_rich_input_submit_strategy(agent);
 
-        let text_bytes = text.into_bytes();
+        let is_agent_command = text.starts_with('/');
+        if is_agent_command && opens_agent_panel(&text) {
+            self.focus_terminal_over_rich_input(ctx);
+        }
+        let text_bytes = if is_agent_command {
+            text.trim_end().as_bytes().to_vec()
+        } else {
+            text.into_bytes()
+        };
 
         // Cleared eagerly so a close from any path sees an empty buffer and doesn't
         // re-save the submitted text as a draft.
         self.input.update(ctx, |input, ctx| {
             input.clear_buffer_and_reset_undo_stack(ctx);
         });
+        self.dismiss_claude_prompt_suggestion(ctx);
 
         // The prefix is written on its own so the agent switches modes before the rest arrives.
         if text_bytes.len() > 1 && CLI_AGENT_MODE_SWITCH_PREFIXES.contains(&text_bytes[0]) {

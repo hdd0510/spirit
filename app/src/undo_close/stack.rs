@@ -104,6 +104,8 @@ pub enum UndoCloseStackEvent {
     DiscardPane(PaneId),
 }
 
+const MAX_UNDO_ITEMS: usize = 10;
+
 /// A stack of closed items which can be re-opened in LIFO order.
 pub struct UndoCloseStack {
     stack: Vec<UndoData>,
@@ -297,7 +299,11 @@ impl UndoCloseStack {
         self.stack.push(UndoData {
             closed_item,
             expiry_data: ExpiryData { id, task_handle },
-        })
+        });
+        while self.stack.len() > MAX_UNDO_ITEMS {
+            let oldest = self.stack.remove(0);
+            oldest.closed_item.discard(ctx);
+        }
     }
 }
 

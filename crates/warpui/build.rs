@@ -133,6 +133,8 @@ fn compile_objc_lib() {
     println!("cargo:rustc-link-lib=framework=SystemConfiguration");
     println!("cargo:rustc-link-lib=framework=UniformTypeIdentifiers");
     println!("cargo:rustc-link-lib=framework=AVFoundation");
+    println!("cargo:rustc-link-lib=framework=CoreMedia");
+    println!("cargo:rerun-if-changed=src/platform/mac/objc/video_view.m");
     println!("cargo:rustc-link-lib=framework=ServiceManagement");
     println!("cargo:rerun-if-changed=src/platform/mac/objc/app.h");
     println!("cargo:rerun-if-changed=src/platform/mac/objc/app.m");
@@ -175,6 +177,7 @@ fn compile_objc_lib() {
         .file("src/platform/mac/objc/window.m")
         .file("src/platform/mac/objc/fullscreen_queue.m")
         .file("src/platform/mac/objc/window_blur.m")
+        .file("src/platform/mac/objc/video_view.m")
         .compile("warp_objc");
 }
 

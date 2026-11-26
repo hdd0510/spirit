@@ -2,6 +2,7 @@ mod action;
 mod block_banner;
 pub mod block_onboarding;
 mod bookmarks;
+mod claude_prompt_suggestion;
 pub mod cli_agent_footer;
 mod context_menu;
 pub mod init;
@@ -238,7 +239,7 @@ use crate::terminal::model::escape_sequences::{
 };
 use crate::terminal::model::grid::grid_handler::{FragmentBoundary, TermMode};
 use crate::terminal::model::index::{Point, Side};
-use crate::terminal::model::mouse::MouseState;
+use crate::terminal::model::mouse::{MouseAction, MouseButton, MouseState};
 use crate::terminal::model::selection::{SelectAction, SelectionDirection};
 use crate::terminal::model::session::active_session::ActiveSession;
 use crate::terminal::model::session::{
@@ -845,6 +846,12 @@ impl SizeUpdateBuilder {
             appearance.line_height_ratio(),
             ctx,
         );
+
+        let new_size = if model.is_alt_screen_active() && view.should_render_cli_agent_footer(ctx) {
+            stretch_rows_to_fill_height(new_size)
+        } else {
+            new_size
+        };
 
         let natural_rows = new_size.rows;
         let natural_cols = new_size.columns;
@@ -1582,6 +1589,10 @@ pub struct TerminalView {
     // Blocks don't necessarily need to be finished for this to be true (e.g. it's true for
     // an empty ssh session where just the active block is remote).
     any_session_contains_remote_blocks: bool,
+    active_ssh_command: Option<String>,
+    running_command_cwd: Option<String>,
+    cli_agent_terminal_focus: bool,
+    claude_prompt_suggestion: Option<String>,
 
     // Whether any session contains restored blocks from a remote session. Cached to improve performance.
     any_session_contains_restored_remote_blocks: bool,
@@ -2480,6 +2491,10 @@ impl TerminalView {
             selected_blocks: Default::default(),
             block_list_mouse_states,
             any_session_contains_remote_blocks: false,
+            active_ssh_command: None,
+            running_command_cwd: None,
+            cli_agent_terminal_focus: false,
+            claude_prompt_suggestion: None,
             any_session_contains_restored_remote_blocks: false,
             mouse_down_block_index: None,
             mouse_states: Default::default(),
@@ -3551,7 +3566,10 @@ impl TerminalView {
         // the PTY is still bootstrapping, in which case the input would be shown
         // but we still want EOT written to the PTY in case there is a program
         // waiting for input during bootstrapping (e.g. omz update).
-        if !self.is_input_box_visible(&model, ctx) || !model.block_list().is_bootstrapped() {
+        if !self.is_input_box_visible(&model, ctx)
+            || self.rich_input_yields_to_terminal(ctx)
+            || !model.block_list().is_bootstrapped()
+        {
             // This is relevant for the case where the user enters CTRL-d while the
             // ssh wrapper command is being run. The EOT character doesn't stop
             // the session immediately, instead it waits until the command passed
@@ -4087,6 +4105,7 @@ impl TerminalView {
             model.block_list_mut().update_active_block_height();
         }
         self.maybe_emit_terminal_view_state_changed_for_long_running_block(ctx);
+        self.sync_claude_prompt_suggestion(ctx);
 
         // Need to re-render both the alt screen and the blocklist on keypresses.
         ctx.notify();
@@ -5208,6 +5227,24 @@ impl TerminalView {
                 }
                 self.did_notify_long_running = false;
 
+                if command.trim_start().starts_with("ssh ") {
+                    self.active_ssh_command = Some(command.trim().to_owned());
+                }
+
+                self.running_command_cwd = None;
+                let command_cwd = leading_cd_target(command).and_then(|target| {
+                    let base = self.pwd()?;
+                    let home = self
+                        .active_block_session_id()
+                        .and_then(|id| self.sessions.as_ref(ctx).get(id))
+                        .and_then(|session| session.home_dir().map(str::to_owned));
+                    resolve_cd_target(&base, target, home.as_deref())
+                });
+                if command_cwd.is_some() {
+                    self.running_command_cwd = command_cwd;
+                    ctx.emit(Event::AppStateChanged);
+                }
+
                 // Snapshot the prompt state as of when the command began executing.
                 // Commands may themselves affect the prompt (if running `git checkout`), for
                 // example, so we want the saved prompt state to match what the user saw when
@@ -5347,6 +5384,19 @@ impl TerminalView {
                 // future already resolved, abort has no effect. We handle this as early as possible
                 // because the abort is time sensitive.
                 self.warpify_state.abort_auto_warpify();
+                self.running_command_cwd = None;
+
+                if let (Some(active), BlockType::User(user_block_completed)) =
+                    (self.active_ssh_command.as_ref(), block_type)
+                {
+                    let completed_command = user_block_completed.command.get_with(|compute| {
+                        let model = self.model.lock();
+                        compute(model.block_list())
+                    });
+                    if completed_command.trim() == active {
+                        self.active_ssh_command = None;
+                    }
+                }
 
                 let active_session = self
                     .active_block_session_id()
@@ -6309,16 +6359,22 @@ impl TerminalView {
             CLIAgentSessionsModelEvent::Started {
                 terminal_view_id, ..
             } if *terminal_view_id == self.view_id => {
-                let mut model = self.model.lock();
-                let active_block = model.block_list_mut().active_block_mut();
-                active_block.enable_full_grid_clear_behavior();
-                if FeatureFlag::TrimTrailingBlankLines.is_enabled() {
-                    active_block.set_trim_trailing_blank_rows(true);
+                {
+                    let mut model = self.model.lock();
+                    let active_block = model.block_list_mut().active_block_mut();
+                    active_block.enable_full_grid_clear_behavior();
+                    if FeatureFlag::TrimTrailingBlankLines.is_enabled() {
+                        active_block.set_trim_trailing_blank_rows(true);
+                    }
                 }
+                self.show_cli_agent_rich_input(ctx);
+                self.cli_agent_terminal_focus = true;
+                self.redetermine_terminal_focus(ctx);
             }
             CLIAgentSessionsModelEvent::Ended {
                 terminal_view_id, ..
             } if *terminal_view_id == self.view_id => {
+                self.cli_agent_terminal_focus = false;
                 let mut model = self.model.lock();
                 let active_block = model.block_list_mut().active_block_mut();
                 if FeatureFlag::TrimTrailingBlankLines.is_enabled() {
@@ -6326,6 +6382,9 @@ impl TerminalView {
                 }
             }
             _ => {}
+        }
+        if event.terminal_view_id() == self.view_id {
+            self.sync_claude_prompt_suggestion(ctx);
         }
         if event.terminal_view_id() == self.view_id
             && matches!(
@@ -7628,6 +7687,7 @@ impl TerminalView {
                 // If the block list isn't bootstrapped yet, there could be something in the .rc file waiting for input,
                 // and we want the paste to go there if the editor isn't focused.
                 self.is_input_box_visible(&model, ctx)
+                    && !self.rich_input_yields_to_terminal(ctx)
                     && (self.input.as_ref(ctx).editor().is_focused(ctx)
                         || model.block_list().is_bootstrapped()),
                 model.needs_bracketed_paste(),
@@ -8666,6 +8726,12 @@ impl TerminalView {
     }
 
     fn alt_mouse_action(&mut self, mouse_state: &MouseState, ctx: &mut ViewContext<Self>) {
+        if matches!(mouse_state.action(), MouseAction::Pressed)
+            && matches!(mouse_state.button(), MouseButton::Left)
+            && self.has_active_cli_agent_input_session(ctx)
+        {
+            self.focus_terminal_over_rich_input(ctx);
+        }
         let escape_sequences = mouse_state
             .to_escape_sequence(self.model.lock().deref())
             .unwrap();
@@ -8789,6 +8855,14 @@ impl TerminalView {
         should_redetermine_focus: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        if matches!(
+            block_action,
+            BlockSelectAction::MouseDown(_) | BlockSelectAction::ClearAllBlocks
+        ) && self.has_active_cli_agent_input_session(ctx)
+        {
+            self.focus_terminal_over_rich_input(ctx);
+        }
+
         // If the input suggestions are showing, remove them and don't update block selection.
         // The mouse up event is excluded here as scrollbar and text selection in input suggestion
         // could cause it to misfire (see WAR-274 and WAR-407).
@@ -9944,6 +10018,15 @@ impl TerminalView {
         ctx.notify();
     }
 
+    fn rich_input_yields_to_terminal(&self, app: &AppContext) -> bool {
+        self.cli_agent_terminal_focus && self.has_active_cli_agent_input_session(app)
+    }
+
+    fn focus_terminal_over_rich_input(&mut self, ctx: &mut ViewContext<Self>) {
+        self.cli_agent_terminal_focus = true;
+        self.focus_terminal(ctx);
+    }
+
     fn reset_selection_to_single_block(
         &mut self,
         block_index: BlockIndex,
@@ -10046,6 +10129,7 @@ impl TerminalView {
     }
 
     fn focus_input_box(&mut self, ctx: &mut ViewContext<Self>) {
+        self.cli_agent_terminal_focus = false;
         self.clear_selected_blocks(ctx);
         self.update_find_selection(ctx);
         ctx.focus(&self.input);
@@ -10131,7 +10215,9 @@ impl TerminalView {
                 && (are_blocks_selected || is_text_selected)
                 && selection_holds_focus;
 
-            has_active_user_terminal_command || has_block_or_text_selection_in_shell_mode
+            has_active_user_terminal_command
+                || has_block_or_text_selection_in_shell_mode
+                || self.rich_input_yields_to_terminal(ctx)
         };
         if should_focus_terminal {
             self.focus_terminal(ctx);
@@ -10524,6 +10610,7 @@ impl TerminalView {
                 self.focus_input_box(ctx);
             }
             InputEvent::EditorFocused => {
+                self.cli_agent_terminal_focus = false;
                 ctx.dispatch_typed_action(&PaneGroupAction::HandleFocusChange);
                 ctx.notify();
             }
@@ -10554,7 +10641,7 @@ impl TerminalView {
                     flavor: *flavor,
                 });
             }
-            InputEvent::CloseCLIAgentRichInput => self.close_cli_agent_rich_input(ctx),
+            InputEvent::CloseCLIAgentRichInput => self.focus_terminal_over_rich_input(ctx),
             InputEvent::SubmitCLIAgentRichInput(text) => {
                 self.submit_cli_agent_rich_input(text.clone(), ctx);
             }
@@ -11506,6 +11593,9 @@ impl TerminalView {
     }
 
     pub fn pwd(&self) -> Option<String> {
+        if let Some(cwd) = self.running_command_cwd.as_ref() {
+            return Some(cwd.clone());
+        }
         self.active_block_metadata
             .as_ref()
             .and_then(BlockMetadata::current_working_directory)
@@ -11527,10 +11617,14 @@ impl TerminalView {
     pub fn pwd_as_local_or_remote(&self, ctx: &AppContext) -> Option<LocalOrRemotePath> {
         let session_id = self.active_block_session_id()?;
         let session = self.sessions.as_ref(ctx).get(session_id)?;
-        let cwd_str = self
-            .active_block_metadata
-            .as_ref()
-            .and_then(BlockMetadata::current_working_directory)?;
+        let overridden_cwd = self.running_command_cwd.clone();
+        let cwd_str = match overridden_cwd.as_deref() {
+            Some(cwd) => cwd,
+            None => self
+                .active_block_metadata
+                .as_ref()
+                .and_then(BlockMetadata::current_working_directory)?,
+        };
 
         if self.session_is_local(session_id, ctx) {
             // Local session: canonicalize to resolve symlinks / normalize.
@@ -11551,6 +11645,91 @@ impl TerminalView {
                 host_id, std_path,
             )))
         }
+    }
+
+    pub fn session_resume_hint(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<crate::session_resume::ResumeHint> {
+        let ssh_command = self.active_ssh_command.clone();
+        let cwd = if ssh_command.is_some() {
+            self.pwd()
+        } else {
+            self.pwd_if_local(ctx)
+        };
+        let agent_command = CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.view_id)
+            .and_then(|session| {
+                let cwd_path = cwd.as_deref().map(std::path::Path::new);
+                match session.session_context.session_id.as_deref() {
+                    Some(id) => {
+                        let command =
+                            crate::terminal::cli_agent_session_history::build_resume_command(
+                                session.agent,
+                                id,
+                                cwd_path,
+                                None,
+                                None,
+                            );
+                        (!command.is_empty()).then_some(command)
+                    }
+                    None if session.agent == CLIAgent::Claude => Some(match cwd.as_deref() {
+                        Some(cwd) => {
+                            format!("cd '{}' && claude --continue", cwd.replace('\'', "'\\''"))
+                        }
+                        None => "claude --continue".to_owned(),
+                    }),
+                    None => None,
+                }
+            });
+        if ssh_command.is_none() && agent_command.is_none() {
+            return None;
+        }
+        Some(crate::session_resume::ResumeHint {
+            ssh_command,
+            agent_command,
+        })
+    }
+
+    pub fn replay_resume_hint(
+        &mut self,
+        hint: crate::session_resume::ResumeHint,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match (hint.ssh_command, hint.agent_command) {
+            (Some(ssh), follow_up) => {
+                self.execute_command_or_set_pending(&ssh, ctx);
+                if let Some(follow_up) = follow_up {
+                    self.run_when_remote(follow_up, 60, ctx);
+                }
+            }
+            (None, Some(agent)) => self.execute_command_or_set_pending(&agent, ctx),
+            (None, None) => {}
+        }
+    }
+
+    fn run_when_remote(
+        &mut self,
+        command: String,
+        attempts_left: u32,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if attempts_left == 0 {
+            return;
+        }
+        ctx.spawn(
+            async { Timer::after(Duration::from_secs(1)).await },
+            move |me, _, ctx| {
+                let is_remote = me
+                    .active_block_session_id()
+                    .is_some_and(|id| !me.session_is_local(id, ctx));
+                if is_remote && !me.has_pending_command_or_awaiting_completion(ctx) {
+                    me.execute_command_or_set_pending(&command, ctx);
+                } else {
+                    me.run_when_remote(command, attempts_left - 1, ctx);
+                }
+            },
+        );
     }
 
     pub fn shell_launch_data_if_local(&self, ctx: &AppContext) -> Option<ShellLaunchData> {
@@ -12083,24 +12262,28 @@ impl TerminalView {
             alt_screen_element,
         );
 
+        let rests_on_agent_footer = self.should_render_cli_agent_footer(app);
+        // We wrap in a `Clipped` to prevent grid text from partially bleeding into the pane header.
+        // This is different from a ClippedScrollable because the alt screen is not actually rendering
+        // unnecessary rows.
+        let mut grid_box = ConstrainedBox::new(Clipped::new(element).finish());
+        if rests_on_agent_footer {
+            grid_box = grid_box.with_height(
+                self.size_info.pane_height_px - 2. * self.size_info.padding_y_px().as_f32(),
+            );
+        }
+        let align = Align::new(grid_box.finish());
+        // Pin the alt-screen origin to the top-left of the pane (adjusted for padding)
+        // to prevent a wiggle-like effect when resizing the pane.
+        let align = if rests_on_agent_footer {
+            align.bottom_left()
+        } else {
+            align.top_left()
+        };
         SavePosition::new(
-            Container::new(
-                Align::new(
-                    ConstrainedBox::new(
-                        // We wrap in a `Clipped` to prevent grid text from partially bleeding into the pane header.
-                        // This is different from a ClippedScrollable because the alt screen is not actually rendering
-                        // unnecessary rows.
-                        Clipped::new(element).finish(),
-                    )
-                    .finish(),
-                )
-                // Pin the alt-screen origin to the top-left of the pane (adjusted for padding)
-                // to prevent a wiggle-like effect when resizing the pane.
-                .top_left()
+            Container::new(align.finish())
+                .with_vertical_padding(self.size_info.padding_y_px().as_f32())
                 .finish(),
-            )
-            .with_vertical_padding(self.size_info.padding_y_px().as_f32())
-            .finish(),
             &self.content_element_position_id,
         )
         .finish()
@@ -13674,7 +13857,13 @@ impl TypedActionView for TerminalView {
             ReinputCommands => self.reinput_commands(false, ctx),
             ReinputCommandsWithSudo => self.reinput_commands(true, ctx),
             ClearBuffer => self.clear_buffer(ctx),
-            Focus => self.redetermine_global_focus(ctx),
+            Focus => {
+                if self.has_active_cli_agent_input_session(ctx) {
+                    self.focus_terminal_over_rich_input(ctx);
+                } else {
+                    self.redetermine_global_focus(ctx);
+                }
+            }
             FocusInputAndClearSelection => self.focus_input_and_clear_selections(ctx),
             ShowFindBar => self.show_find_bar(ctx),
             SelectPriorBlock => {
@@ -14024,7 +14213,12 @@ impl View for TerminalView {
 
                 let input_box_visible = self.is_input_box_visible(&model, app);
                 if !input_box_visible && self.should_render_cli_agent_footer(app) {
-                    column.add_child(ChildView::new(&self.cli_agent_footer).finish());
+                    column.add_child(
+                        Container::new(ChildView::new(&self.cli_agent_footer).finish())
+                            .with_padding_left(*PADDING_LEFT)
+                            .with_padding_right(*PADDING_LEFT)
+                            .finish(),
+                    );
                 }
 
                 if input_box_visible {
@@ -14651,6 +14845,21 @@ pub fn create_size_info(
     }
 }
 
+const ROW_ROUNDING_HEADROOM: f32 = 0.01;
+
+fn stretch_rows_to_fill_height(size: SizeInfo) -> SizeInfo {
+    let rows = size.rows as f32;
+    let fill_height = size.pane_height_px - 2. * size.padding_y_px().as_f32();
+    let stretched = fill_height / (rows + ROW_ROUNDING_HEADROOM);
+    if rows <= 0. || stretched <= size.cell_height_px.as_f32() {
+        return size;
+    }
+    SizeInfo {
+        cell_height_px: stretched.into_pixels(),
+        ..size
+    }
+}
+
 /// Returns CellSizeAndWindowPadding for the given font params and line height.
 pub fn cell_size_and_padding(
     font_cache: &FontCache,
@@ -14671,6 +14880,42 @@ pub fn cell_size_and_padding(
         padding_x_px: padding_x_px.into_pixels(),
         padding_y_px: padding_y_px.into_pixels(),
     }
+}
+
+fn leading_cd_target(command: &str) -> Option<&str> {
+    let first_segment_end = command.find("&&").or_else(|| command.find(';'))?;
+    let segment = command[..first_segment_end].trim();
+    let target = segment.strip_prefix("cd ")?.trim();
+    let target = target
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .or_else(|| target.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))
+        .unwrap_or(target);
+    let is_plain =
+        !target.is_empty() && target != "-" && !target.contains(['$', '`', '*', '?', '\\', ' ']);
+    is_plain.then_some(target)
+}
+
+fn resolve_cd_target(base: &str, target: &str, home: Option<&str>) -> Option<String> {
+    let joined = if let Some(rest) = target.strip_prefix('~') {
+        let home = home?;
+        format!("{home}{rest}")
+    } else if target.starts_with('/') {
+        target.to_owned()
+    } else {
+        format!("{}/{target}", base.trim_end_matches('/'))
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 fn command_first_word_and_suffix(command: &str) -> Option<(&str, &str)> {

@@ -15,6 +15,7 @@ pub mod time_format;
 pub mod tooltips;
 pub(crate) mod traffic_lights;
 pub(crate) mod truncation;
+pub mod video_player;
 pub mod vm_detection;
 #[cfg(windows)]
 pub mod windows;

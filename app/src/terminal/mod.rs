@@ -221,7 +221,10 @@ impl SizeUpdate {
 
     /// Returns whether there was any change with this update.
     pub fn anything_changed(&self) -> bool {
-        self.pane_size_changed() || self.gap_height_changed() || self.rows_or_columns_changed()
+        self.pane_size_changed()
+            || self.gap_height_changed()
+            || self.rows_or_columns_changed()
+            || self.last_size.cell_height_px != self.new_size.cell_height_px
     }
 
     pub fn rows_or_columns_changed(&self) -> bool {

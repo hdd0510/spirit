@@ -110,6 +110,14 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("CodeEditorView"))
         .with_key_binding("cmdorctrl-r u"),
+        EditableBinding::new(
+            "code_view:close_active_tab",
+            "Close the current file tab",
+            CodeViewAction::CloseActiveTab,
+        )
+        .with_context_predicate(id!("CodeView"))
+        .with_custom_action(crate::util::bindings::CustomAction::CloseCurrentSession)
+        .with_key_binding("cmdorctrl-w"),
     ]);
 }
 
@@ -139,6 +147,7 @@ pub enum CodeViewAction {
     },
     CloseAll,
     CloseSaved,
+    CloseActiveTab,
     ToggleMaximized,
     #[cfg(feature = "local_fs")]
     CopyFilePath,
@@ -147,6 +156,7 @@ pub enum CodeViewAction {
     /// no resolvable local path.
     #[cfg(feature = "local_fs")]
     RevealInFinder,
+    OpenVideoExternally,
     #[cfg(feature = "local_fs")]
     RenderMarkdown,
     DragOverIndex {
@@ -224,6 +234,22 @@ pub struct CodeView {
     window_id: WindowId,
     drag_position: Option<TabBarDragPosition>,
     markdown_mode_segmented_control: Option<ViewHandle<MarkdownToggleView>>,
+    keep_open_when_empty: bool,
+    videos: HashMap<PathBuf, VideoState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum VideoState {
+    Preparing,
+    Ready(PathBuf),
+    Failed,
+}
+
+fn is_local_video(location: &LocalOrRemotePath) -> bool {
+    cfg!(target_os = "macos")
+        && location
+            .to_local_path()
+            .is_some_and(crate::util::openable_file_type::is_video_file)
 }
 
 impl CodeView {
@@ -240,6 +266,8 @@ impl CodeView {
             window_id,
             drag_position: None,
             markdown_mode_segmented_control: None,
+            keep_open_when_empty: false,
+            videos: HashMap::new(),
         }
     }
 
@@ -426,6 +454,62 @@ impl CodeView {
         })
     }
 
+    fn is_video_active(&self) -> bool {
+        self.tab_at(self.active_tab_index)
+            .and_then(|tab| tab.location.as_ref())
+            .is_some_and(is_local_video)
+    }
+
+    fn prepare_video(&mut self, location: &LocalOrRemotePath, ctx: &mut ViewContext<Self>) {
+        let Some(path) = location.to_local_path().map(Path::to_path_buf) else {
+            return;
+        };
+        if crate::util::video_player::plays_natively(&path) {
+            self.videos.insert(path.clone(), VideoState::Ready(path));
+            return;
+        }
+        self.videos.insert(path.clone(), VideoState::Preparing);
+        let (tx, rx) = async_channel::bounded(1);
+        let input = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.try_send(crate::util::video_player::prepare_for_playback(&input));
+        });
+        ctx.spawn(
+            async move { rx.recv().await.ok().flatten() },
+            move |me, playable, ctx| {
+                let state = playable.map_or(VideoState::Failed, VideoState::Ready);
+                me.videos.insert(path, state);
+                ctx.notify();
+            },
+        );
+    }
+
+    fn render_video(&self, path: &Path, app: &AppContext) -> Box<dyn Element> {
+        let message = match self.videos.get(path) {
+            Some(VideoState::Ready(playable)) => {
+                return Container::new(warpui::elements::Video::new(playable.clone()).finish())
+                    .with_uniform_padding(PADDING)
+                    .finish();
+            }
+            Some(VideoState::Failed) => {
+                "This video can't be played here. Use \"Open in default app\" from the pane menu."
+            }
+            Some(VideoState::Preparing) | None => "Preparing video…",
+        };
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        Align::new(
+            Text::new(
+                message,
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish(),
+        )
+        .finish()
+    }
+
     fn build_tab_data(
         &mut self,
         location: Option<LocalOrRemotePath>,
@@ -433,12 +517,17 @@ impl CodeView {
         ctx: &mut ViewContext<Self>,
     ) -> TabData {
         let (code_editor, tab_location) = match location {
+            Some(loc) if is_local_video(&loc) => (self.construct_new_file_editor(ctx), Some(loc)),
             Some(loc) => {
                 let editor = self.construct_editor_for_location(loc.clone(), ctx);
                 (editor, Some(loc))
             }
             None => (self.construct_new_file_editor(ctx), None),
         };
+
+        if let Some(location) = tab_location.as_ref().filter(|loc| is_local_video(loc)) {
+            self.prepare_video(location, ctx);
+        }
 
         let editor = code_editor.as_ref(ctx).editor().clone();
 
@@ -462,7 +551,7 @@ impl CodeView {
             });
         }
 
-        ctx.subscribe_to_view(&code_editor, |me, _, event, ctx| match event {
+        ctx.subscribe_to_view(&code_editor, |me, editor_handle, event, ctx| match event {
             LocalCodeEditorEvent::FileLoaded => {
                 me.pane_configuration.update(ctx, |pane_config, ctx| {
                     pane_config.refresh_pane_header_overflow_menu_items(ctx);
@@ -474,6 +563,14 @@ impl CodeView {
                 // file path might not exist currently if the intention is to create a new file
                 // or if the project rules file doesn't exist yet.
                 if let CodeSource::New { .. } | CodeSource::ProjectRules { .. } = me.source {
+                    return;
+                }
+                let is_image = editor_handle
+                    .as_ref(ctx)
+                    .file_location()
+                    .and_then(|location| location.to_local_path())
+                    .is_some_and(crate::util::openable_file_type::is_supported_image_file);
+                if is_image {
                     return;
                 }
                 log::warn!("Failed to load file. {err:?}");
@@ -591,13 +688,29 @@ impl CodeView {
         })
     }
 
+    pub fn has_open_tabs(&self) -> bool {
+        !self.tab_group.is_empty()
+    }
+
+    pub fn close_active_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        self.handle_action(&CodeViewAction::CloseActiveTab, ctx);
+    }
+
     pub fn pane_configuration(&self) -> ModelHandle<PaneConfiguration> {
         self.pane_configuration.clone()
     }
 
     pub fn focus(&self, ctx: &mut ViewContext<Self>) {
         if let Some(tab) = self.tab_at(self.active_tab_index) {
-            ctx.focus(&tab.editor_view);
+            let is_image = tab.local_path().is_some_and(|path| {
+                crate::util::openable_file_type::is_supported_image_file(&path)
+                    || crate::util::openable_file_type::is_video_file(&path)
+            });
+            if is_image {
+                ctx.focus_self();
+            } else {
+                ctx.focus(&tab.editor_view);
+            }
         }
     }
 
@@ -1323,7 +1436,11 @@ impl CodeView {
 
     fn update_tab_bar_state(&mut self, ctx: &mut ViewContext<Self>) {
         if self.tab_group.is_empty() {
-            ctx.emit(CodeViewEvent::Pane(PaneEvent::Close));
+            if std::mem::take(&mut self.keep_open_when_empty) {
+                ctx.notify();
+            } else {
+                ctx.emit(CodeViewEvent::Pane(PaneEvent::Close));
+            }
         } else {
             self.set_title_after_content_update(ctx);
             ctx.notify();
@@ -1987,6 +2104,14 @@ impl CodeView {
                 );
             }
 
+            if active_location.is_some_and(is_local_video) {
+                items.push(
+                    MenuItemFields::new("Open in default app")
+                        .with_on_select_action(CodeViewAction::OpenVideoExternally)
+                        .into_item(),
+                );
+            }
+
             if local_path.is_some() {
                 let reveal_label = if cfg!(target_os = "macos") {
                     "Reveal in Finder"
@@ -2028,6 +2153,13 @@ impl CodeView {
 
     /// Merges tabs from another `CodeView`, avoiding duplicates and updating the active tab index.
     pub fn merge_tabs(&mut self, source_code_view: &CodeView, ctx: &mut ViewContext<Self>) {
+        for (path, state) in &source_code_view.videos {
+            if *state != VideoState::Preparing {
+                self.videos.insert(path.clone(), state.clone());
+            } else {
+                self.prepare_video(&LocalOrRemotePath::Local(path.clone()), ctx);
+            }
+        }
         let existing_locations_to_idx: HashMap<&LocalOrRemotePath, usize> = self
             .tab_group
             .iter()
@@ -2073,10 +2205,35 @@ impl View for CodeView {
         "CodeView"
     }
 
-    fn render(&self, _app: &AppContext) -> Box<dyn Element> {
+    fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let tab = self.tab_at(self.active_tab_index);
-        let body = if let Some(tab) = tab {
-            ChildView::new(&tab.editor_view).finish()
+        let video = tab
+            .and_then(|tab| tab.location.as_ref())
+            .filter(|location| is_local_video(location))
+            .and_then(|location| location.to_local_path());
+        let body = if let Some(path) = video {
+            self.render_video(path, app)
+        } else if let Some(tab) = tab {
+            match tab
+                .local_path()
+                .filter(|path| crate::util::openable_file_type::is_supported_image_file(path))
+            {
+                Some(path) => {
+                    let image = warpui::elements::Image::new(
+                        warpui::assets::asset_cache::AssetSource::LocalFile {
+                            path: path.to_string_lossy().into_owned(),
+                            content_version: None,
+                        },
+                        warpui::elements::CacheOption::Original,
+                    )
+                    .contain()
+                    .finish();
+                    Container::new(Align::new(image).finish())
+                        .with_uniform_padding(PADDING)
+                        .finish()
+                }
+                None => ChildView::new(&tab.editor_view).finish(),
+            }
         } else {
             Empty::new().finish()
         };
@@ -2090,6 +2247,7 @@ impl TypedActionView for CodeView {
 
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
+            CodeViewAction::SaveFile | CodeViewAction::SaveFileAs if self.is_video_active() => {}
             CodeViewAction::SaveFile => {
                 self.save_local(self.active_tab_index, None, ctx);
             }
@@ -2104,6 +2262,11 @@ impl TypedActionView for CodeView {
                 self.remove_tab_with_confirmation(*index, false, ctx);
             }
 
+            CodeViewAction::CloseActiveTab => {
+                self.keep_open_when_empty = true;
+                self.remove_tab_with_confirmation(self.active_tab_index, false, ctx);
+            }
+
             CodeViewAction::CloseAll => {
                 let unsaved_indices = self.unsaved_indices(ctx);
                 self.process_next_tab_for_clear(unsaved_indices, 0, ctx);
@@ -2111,6 +2274,15 @@ impl TypedActionView for CodeView {
 
             CodeViewAction::CloseSaved => {
                 self.close_saved_tabs(ctx);
+            }
+
+            CodeViewAction::OpenVideoExternally => {
+                let path = self
+                    .tab_at(self.active_tab_index)
+                    .and_then(|tab| tab.local_path());
+                if let Some(path) = path {
+                    crate::util::video_player::open_video(path);
+                }
             }
 
             CodeViewAction::ToggleMaximized => {

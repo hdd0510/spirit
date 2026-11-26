@@ -15,7 +15,7 @@ use warpui::platform::menu::{
     CustomMenuItem, Menu, MenuBar, MenuItem, MenuItemProperties, MenuItemPropertyChanges,
 };
 use warpui::windowing::WindowManager;
-use warpui::{AppContext, SingletonEntity};
+use warpui::{AppContext, SingletonEntity, TypedActionView as _, WindowId};
 
 use crate::default_terminal::DefaultTerminal;
 use crate::features::{FeatureFlag, runtime_flags_menu_items};
@@ -31,6 +31,7 @@ use crate::user_config::WarpConfig;
 use crate::util::bindings::{self, CustomAction, trigger_to_keystroke};
 use crate::util::links;
 use crate::workspace::sync_inputs::SyncedInputState;
+use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
 use crate::workspace_metadata::WorkspaceMetadata;
 
 type CheckmarkStatusGetter = dyn 'static + Fn(&mut AppContext) -> bool;
@@ -990,8 +991,20 @@ fn custom_action_dispatcher(action: CustomAction) -> impl Fn(&mut AppContext) + 
 /// or make a new window if there is no active window.
 fn open_new_default_tab_or_window(ctx: &mut AppContext) {
     match WindowManager::handle(ctx).as_ref(ctx).active_window() {
-        Some(wid) => ctx.dispatch_custom_action(CustomAction::NewTab, wid),
+        Some(wid) => open_new_default_tab(wid, ctx),
         _ => open_new_window(ctx),
+    }
+}
+
+pub(crate) fn open_new_default_tab(window_id: WindowId, ctx: &mut AppContext) {
+    let empty_workspace = WorkspaceRegistry::as_ref(ctx)
+        .get(window_id, ctx)
+        .filter(|workspace| workspace.as_ref(ctx).has_empty_placeholder());
+    match empty_workspace {
+        Some(workspace) => workspace.update(ctx, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::AddDefaultTab, ctx);
+        }),
+        None => ctx.dispatch_custom_action(CustomAction::NewTab, window_id),
     }
 }
 

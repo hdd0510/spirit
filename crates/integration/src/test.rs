@@ -31,6 +31,8 @@ mod ssh;
 mod subshell;
 mod sync_inputs;
 mod typeahead;
+#[cfg(target_os = "macos")]
+mod video_playback;
 mod video_recording;
 mod workflows;
 mod workspace;
@@ -81,6 +83,8 @@ pub use sync_inputs::*;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 pub use typeahead::*;
 use version_compare::Cmp;
+#[cfg(target_os = "macos")]
+pub use video_playback::*;
 pub use video_recording::*;
 use warp::appearance::Appearance;
 use warp::cmd_or_ctrl_shift;

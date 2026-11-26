@@ -431,6 +431,8 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
 
     // Video recording test (manual only)
     register_test!(test_video_recording);
+    #[cfg(target_os = "macos")]
+    register_test!(test_video_playback);
     register_test!(test_remote_control_mirror);
 
     // Rich Input Ctrl+Enter submit toggle (issue #11588)

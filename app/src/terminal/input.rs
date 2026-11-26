@@ -157,7 +157,7 @@ use crate::terminal::cli_agent_sessions::{
 use crate::terminal::input::buffer_model::InputBufferModel;
 use crate::terminal::input::inline_history::InlineHistoryMenuView;
 use crate::terminal::input::inline_menu::InlineMenuPositioner;
-use crate::terminal::input::slash_command_model::SlashCommandModel;
+use crate::terminal::input::slash_command_model::{SlashCommandEntryState, SlashCommandModel};
 use crate::terminal::input::slash_commands::{
     GuiSlashCommandDataSource, InlineSlashCommandView, SlashCommandDataSource as _,
     SlashCommandTrigger, UpdatedActiveCommands,
@@ -1408,10 +1408,13 @@ impl Input {
                     middle_click_paste: false,
                     allow_user_cursor_preference: true,
                     delegate_paste_handling: true,
-                    keymap_context_modifier: Some(Box::new(move |context, _app| {
+                    keymap_context_modifier: Some(Box::new(move |context, app| {
                         context
                             .set
                             .insert(flags::TERMINAL_INPUT_PAGE_KEYS_HANDLED_BY_INPUT);
+                        if CLIAgentSessionsModel::as_ref(app).is_input_open(terminal_view_id) {
+                            context.set.insert(flags::CLI_AGENT_RICH_INPUT_OPEN);
+                        }
                     })),
                     ..Default::default()
                 };
@@ -1603,6 +1606,7 @@ impl Input {
             &slash_command_data_source,
             |me, _, _: &UpdatedActiveCommands, ctx| {
                 me.set_zero_state_hint_text(ctx);
+                me.reopen_agent_commands_menu(ctx);
                 ctx.notify();
             },
         );
@@ -1699,7 +1703,28 @@ impl Input {
         input
     }
 
+    #[cfg(test)]
+    pub(crate) fn slash_command_data_source_for_test(
+        &self,
+    ) -> ModelHandle<GuiSlashCommandDataSource> {
+        self.slash_command_data_source.clone()
+    }
+
+    fn reopen_agent_commands_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        let is_agent_input =
+            CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id);
+        let is_composing = matches!(
+            self.slash_command_model.as_ref(ctx).state(),
+            SlashCommandEntryState::Composing { .. }
+        );
+        if is_agent_input && is_composing && self.suggestions_mode_model.as_ref(ctx).is_closed() {
+            self.open_slash_commands_menu(ctx);
+        }
+    }
+
     fn open_slash_commands_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        self.slash_command_data_source
+            .update(ctx, |source, ctx| source.refresh_agent_commands(ctx));
         // Don't open menu if there's a long-running command — unless the CLI agent
         // rich input is open (the CLI agent itself is the long-running command).
         let is_cli_agent_input =
@@ -5536,7 +5561,13 @@ impl Input {
         ctx.emit(Event::Enter);
 
         if CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id) {
-            self.submit_cli_agent_rich_input(ctx);
+            if self.should_enter_pick_agent_command(ctx) {
+                self.inline_slash_commands_view.update(ctx, |view, ctx| {
+                    view.accept_selected_item(false, ctx);
+                });
+            } else {
+                self.submit_cli_agent_rich_input(ctx);
+            }
         } else if self.should_insert_newline_on_enter(ctx) {
             self.editor.update(ctx, |editor, ctx| {
                 editor.user_initiated_insert("\n", PlainTextEditorViewAction::NewLine, ctx)
@@ -5590,6 +5621,19 @@ impl Input {
 
             self.model.lock().set_is_input_dirty(false);
         }
+    }
+
+    fn should_enter_pick_agent_command(&self, ctx: &AppContext) -> bool {
+        self.suggestions_mode_model.as_ref(ctx).is_slash_commands()
+            && self
+                .inline_slash_commands_view
+                .as_ref(ctx)
+                .result_count(ctx)
+                > 0
+            && !self
+                .slash_command_data_source
+                .as_ref(ctx)
+                .is_exact_agent_command(&self.buffer_text(ctx))
     }
 
     fn submit_cli_agent_rich_input(&mut self, ctx: &mut ViewContext<Self>) {

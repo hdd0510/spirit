@@ -57,6 +57,7 @@ mod resource_limits;
 mod safe_triangle;
 mod search_bar;
 mod session_management;
+mod session_resume;
 mod shell_indicator;
 mod status_item;
 mod suggestions;

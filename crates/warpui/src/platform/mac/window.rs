@@ -430,6 +430,13 @@ unsafe extern "C" {
         backgroundBlurRadiusPixels: u8,
         testMode: Bool,
     ) -> *mut NSWindow;
+    fn warp_sync_video_views(
+        host: *const Object,
+        paths: *const *const std::ffi::c_char,
+        frames: *const NSRect,
+        covered: *const Bool,
+        count: NSUInteger,
+    );
     fn create_warp_nspanel(
         contentRect: NSRect,
         metalDevice: *mut ProtocolObject<dyn MTLDevice>,
@@ -1405,6 +1412,38 @@ extern "C-unwind" fn warp_view_set_frame_size(this: &Object, size: NSSize, async
     dispatch_window_resized(window, async_callback);
 }
 
+fn sync_video_views(host: &Object, scene: &Scene) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut paths = Vec::new();
+    let mut frames = Vec::new();
+    let mut covered = Vec::new();
+    for (video, is_covered) in scene.videos() {
+        let Ok(path) = std::ffi::CString::new(video.path.as_os_str().as_bytes()) else {
+            continue;
+        };
+        paths.push(path);
+        frames.push(NSRect::new(
+            NSPoint::new(
+                video.bounds.origin_x() as f64,
+                video.bounds.origin_y() as f64,
+            ),
+            NSSize::new(video.bounds.width() as f64, video.bounds.height() as f64),
+        ));
+        covered.push(Bool::new(is_covered));
+    }
+    let path_ptrs: Vec<_> = paths.iter().map(|path| path.as_ptr()).collect();
+    unsafe {
+        warp_sync_video_views(
+            host,
+            path_ptrs.as_ptr(),
+            frames.as_ptr(),
+            covered.as_ptr(),
+            path_ptrs.len() as NSUInteger,
+        );
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C-unwind" fn warp_update_layer(this: &Object) {
     if !app::callback_dispatcher().can_borrow_mut() {
@@ -1436,6 +1475,7 @@ extern "C-unwind" fn warp_update_layer(this: &Object) {
 
             scene
         };
+        sync_video_views(this, &scene);
         debug_assert!(
             window.next_scene.try_borrow_mut().is_ok(),
             "Should not be holding a borrow of the scene RefCell before beginning to render."

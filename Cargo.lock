@@ -5588,6 +5588,7 @@ dependencies = [
  "lazy_static",
  "log",
  "nix 0.26.4",
+ "objc2 0.6.3",
  "parking_lot",
  "pathfinder_geometry",
  "rand 0.8.6",

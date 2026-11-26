@@ -685,6 +685,9 @@ pub struct Workspace {
     screen_id: EntityId,
     project_id: Option<ProjectId>,
     screen_teardown_in_progress: bool,
+    empty_placeholder: Option<EntityId>,
+    creating_empty_placeholder: bool,
+    remote_media_downloads: HashSet<warp_util::remote_path::RemotePath>,
     pub(crate) tabs: Vec<TabData>,
     active_tab_index: usize,
     /// Tracks tab activation order (most-recently-used first).
@@ -2177,6 +2180,9 @@ impl Workspace {
             screen_id: ctx.view_id(),
             project_id,
             screen_teardown_in_progress: false,
+            empty_placeholder: None,
+            creating_empty_placeholder: false,
+            remote_media_downloads: HashSet::new(),
             tabs: Vec::new(),
             active_tab_index: 0,
             tab_mru_order: Vec::new(),
@@ -4436,6 +4442,22 @@ impl Workspace {
         code_source: CodeSource,
         ctx: &mut ViewContext<Self>,
     ) {
+        if path.is_file() {
+            if !cfg!(target_os = "macos") && crate::util::openable_file_type::is_video_file(&path) {
+                crate::util::video_player::open_video(path);
+                return;
+            }
+        }
+
+        let target = if (crate::util::openable_file_type::is_supported_image_file(&path)
+            || crate::util::openable_file_type::is_video_file(&path))
+            && !matches!(target, FileTarget::CodeEditor(_))
+        {
+            FileTarget::CodeEditor(EditorLayout::SplitPane)
+        } else {
+            target
+        };
+
         // Handle directories for CodeEditor(NewTab) target by opening a new terminal tab
         if path.is_dir() && matches!(target, FileTarget::CodeEditor(EditorLayout::NewTab)) {
             self.add_tab_with_pane_layout(
@@ -4566,6 +4588,16 @@ impl Workspace {
                     LocalOrRemotePath::Remote(_) => {
                         #[cfg(feature = "local_fs")]
                         {
+                            if let LocalOrRemotePath::Remote(remote_path) = location
+                                && (crate::util::openable_file_type::is_video_file(Path::new(
+                                    remote_path.path.as_str(),
+                                )) || crate::util::openable_file_type::is_supported_image_file(
+                                    Path::new(remote_path.path.as_str()),
+                                ))
+                            {
+                                self.open_remote_video(remote_path.clone(), ctx);
+                                return;
+                            }
                             // Honor a notebook-viewer target (e.g. a remote
                             // Jupyter notebook) instead of always opening remote
                             // files as raw code in the editor.
@@ -4609,6 +4641,103 @@ impl Workspace {
                 self.confirm_delete_agent_session(session.clone(), ctx);
             }
         }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn open_remote_video(
+        &mut self,
+        remote_path: warp_util::remote_path::RemotePath,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+        let socket_paths =
+            RemoteServerManager::as_ref(ctx).control_sockets_for_host(&remote_path.host_id);
+        if socket_paths.is_empty() {
+            self.toast_stack.update(ctx, |toast_stack, ctx| {
+                let toast = DismissibleToast::error(
+                    "No active SSH connection to download this file.".to_string(),
+                );
+                toast_stack.add_persistent_toast(toast, ctx);
+            });
+            return;
+        }
+
+        let remote_file = remote_path.path.as_str().to_string();
+        let Some(file_name) = Path::new(&remote_file)
+            .file_name()
+            .map(|name| name.to_owned())
+        else {
+            return;
+        };
+        let display_name = file_name.to_string_lossy().into_owned();
+        let toast_id = format!("remote-media-download:{remote_file}");
+        if !self.remote_media_downloads.insert(remote_path.clone()) {
+            return;
+        }
+        self.toast_stack.update(ctx, |toast_stack, ctx| {
+            let toast = DismissibleToast::default(format!("Downloading {display_name}…"))
+                .with_object_id(toast_id.clone());
+            toast_stack.add_persistent_toast(toast, ctx);
+        });
+
+        let local_dir = remote_media_cache_dir(&remote_path);
+        let local_path = local_dir.join(&file_name);
+        let partial_path = local_dir.join(format!("{display_name}.partial"));
+
+        ctx.spawn(
+            async move {
+                std::fs::create_dir_all(&local_dir)?;
+                let mut last_error = anyhow::anyhow!("no usable SSH connection");
+                for socket_path in &socket_paths {
+                    match remote_server::ssh::scp_download(
+                        socket_path,
+                        &remote_file,
+                        &partial_path,
+                        DOWNLOAD_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            std::fs::rename(&partial_path, &local_path)?;
+                            return anyhow::Ok(local_path);
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "Remote media download via {} failed: {err}",
+                                socket_path.display()
+                            );
+                            last_error = err;
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&partial_path);
+                Err(last_error)
+            },
+            move |me, result, ctx| {
+                me.remote_media_downloads.remove(&remote_path);
+                me.toast_stack.update(ctx, |toast_stack, ctx| {
+                    toast_stack.dismiss_older_toasts(&toast_id, ctx);
+                });
+                match result {
+                    Ok(local_path) => {
+                        if cfg!(target_os = "macos")
+                            || crate::util::openable_file_type::is_supported_image_file(&local_path)
+                        {
+                            me.open_image_tab(local_path, ctx);
+                        } else {
+                            crate::util::video_player::open_video(local_path);
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("Failed to download {display_name}: {err}");
+                        me.toast_stack.update(ctx, |toast_stack, ctx| {
+                            toast_stack.add_persistent_toast(DismissibleToast::error(message), ctx);
+                        });
+                    }
+                }
+            },
+        );
     }
 
     fn confirm_delete_agent_session(
@@ -6353,13 +6482,7 @@ impl Workspace {
         );
 
         match layout {
-            EditorLayout::NewTab => {
-                // File notebooks join the active tab's group (if any)
-                // and stay contiguous instead of splitting it.
-                let (new_idx, group_id) = self.new_tab_index_and_group(ctx);
-                self.add_tab_from_existing_pane(Box::new(pane), new_idx, group_id, ctx);
-            }
-            EditorLayout::SplitPane => {
+            EditorLayout::NewTab | EditorLayout::SplitPane => {
                 self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
                     pane_group.add_pane_with_direction(
                         Direction::Right,
@@ -8952,6 +9075,28 @@ impl Workspace {
         self.vertical_tabs_panel
             .clear_detail_sidecar_if_for_pane_group(pane_group.id());
 
+        if self.tabs.len() == 1
+            && self.empty_placeholder.is_some()
+            && !self.screen_teardown_in_progress
+        {
+            return;
+        }
+
+        let make_placeholder = self.tabs.len() == 1
+            && !self.screen_teardown_in_progress
+            && !self.window_has_other_screens(ctx);
+        if make_placeholder {
+            self.creating_empty_placeholder = true;
+            self.add_terminal_tab(true, ctx);
+            self.creating_empty_placeholder = false;
+            self.empty_placeholder = self
+                .tabs
+                .iter()
+                .map(|tab| tab.pane_group.id())
+                .find(|id| *id != pane_group.id());
+            self.focus_active_tab(ctx);
+        }
+
         if self.tabs.len() == 1 {
             if self.screen_teardown_in_progress {
                 self.detach_panes_for_tab_close(&pane_group, ctx);
@@ -9139,10 +9284,13 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         let is_last_tab = self.tabs.len() == 1;
+        if self.empty_placeholder.is_some() {
+            return;
+        }
         if !ContextFlag::CloseWindow.is_enabled() && is_last_tab {
             return;
         }
-        let closes_window = is_last_tab && !self.window_has_other_screens(ctx);
+        let closes_window = false;
 
         let tabs_closed = self.close_tabs(
             vec![index].into_iter(),
@@ -9301,8 +9449,22 @@ impl Workspace {
         }
 
         self.activate_tab(insert_index, ctx);
+        let stale_placeholder = self.empty_placeholder.take();
+        self.drop_placeholder_tab(stale_placeholder, ctx);
 
         ctx.notify();
+    }
+
+    fn drop_placeholder_tab(&mut self, placeholder: Option<EntityId>, ctx: &mut ViewContext<Self>) {
+        let Some(id) = placeholder else {
+            return;
+        };
+        if self.tabs.len() < 2 {
+            return;
+        }
+        if let Some(index) = self.tabs.iter().position(|tab| tab.pane_group.id() == id) {
+            self.remove_tab(index, false, true, ctx);
+        }
     }
 
     /// Insertion index for a restored tab that is not part of an existing group.
@@ -9356,6 +9518,19 @@ impl Workspace {
             ctx,
         );
         ctx.notify();
+    }
+
+    fn open_image_tab(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        let code_source = CodeSource::FileTree {
+            location: LocalOrRemotePath::Local(path.clone()),
+        };
+        self.open_file_with_target(
+            path,
+            FileTarget::CodeEditor(EditorLayout::SplitPane),
+            None,
+            code_source,
+            ctx,
+        );
     }
 
     fn add_get_started_tab(&mut self, ctx: &mut ViewContext<Self>) {
@@ -9562,6 +9737,15 @@ impl Workspace {
         hide_homepage: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        if matches!(new_session_source, NewSessionSource::Tab)
+            && chosen_shell.is_none()
+            && self.empty_placeholder.take().is_some()
+        {
+            self.focus_active_tab(ctx);
+            ctx.notify();
+            return;
+        }
+
         let startup_directory = self.get_new_tab_startup_directory(
             new_session_source,
             previous_session_window_id,
@@ -9751,10 +9935,12 @@ impl Workspace {
         };
         let inherited_worktree_id = self.inherited_worktree_id();
         self.tabs.insert(insert_idx, TabData::new(new_pane_group));
+        let stale_placeholder = self.empty_placeholder.take();
         self.tabs[insert_idx].worktree_id = inherited_worktree_id;
         self.tab_mru_order
             .push(self.tabs[insert_idx].pane_group.id());
         self.activate_tab_internal(insert_idx, ctx);
+        self.drop_placeholder_tab(stale_placeholder, ctx);
 
         // Inherit the active tab's group membership (skipped for top-level tabs).
         if let Some(group_id) = inherited_group_id {
@@ -9983,13 +10169,7 @@ impl Workspace {
             let pane = CodePane::new(source, None, ctx);
 
             match layout {
-                EditorLayout::NewTab => {
-                    // A new code file opened in a new tab joins the active tab's
-                    // group (if any) and stays contiguous instead of splitting it.
-                    let (new_idx, group_id) = self.new_tab_index_and_group(ctx);
-                    self.add_tab_from_existing_pane(Box::new(pane), new_idx, group_id, ctx);
-                }
-                EditorLayout::SplitPane => {
+                EditorLayout::NewTab | EditorLayout::SplitPane => {
                     self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
                         pane_group.add_pane_with_direction(
                             Direction::Right,
@@ -12660,7 +12840,15 @@ impl Workspace {
         };
     }
 
+    pub(crate) fn has_empty_placeholder(&self) -> bool {
+        self.empty_placeholder.is_some()
+    }
+
     pub fn focus_active_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.creating_empty_placeholder || self.has_empty_placeholder() {
+            ctx.focus_self();
+            return;
+        }
         self.active_tab_pane_group().update(ctx, |tab, ctx| {
             tab.focus(ctx);
         })
@@ -13854,7 +14042,11 @@ impl Workspace {
             // Collapse tabs into render slots: each ungrouped tab is a
             // `Single`, and each contiguous run of same-group tabs is one
             // `Group`.
-            let slots = self.tab_bar_slots();
+            let slots = if self.empty_placeholder.is_some() {
+                Vec::new()
+            } else {
+                self.tab_bar_slots()
+            };
 
             // Render each slot in the tab bar, either an individual tab or tab group.
             for slot in &slots {
@@ -14568,6 +14760,11 @@ impl Workspace {
         app: &AppContext,
         appearance: &Appearance,
     ) -> Box<dyn Element> {
+        if self.empty_placeholder.is_some() {
+            return Container::new(Empty::new().finish())
+                .with_background(util::get_terminal_background_fill(self.window_id, app))
+                .finish();
+        }
         let active_tab_data = &self.tabs[self.active_tab_index];
 
         let active_content = ChildView::new(&active_tab_data.pane_group).finish();
@@ -16619,12 +16816,41 @@ impl TypedActionView for Workspace {
                 ctx.notify();
             }
             ClosePanel => {
+                let side_panel_focused = self.left_panel_view.is_self_or_child_focused(ctx)
+                    || self.right_panel_view.is_self_or_child_focused(ctx);
+                if side_panel_focused {
+                    let code_view = self
+                        .active_tab_pane_group()
+                        .as_ref(ctx)
+                        .code_views(ctx)
+                        .into_iter()
+                        .find(|view| view.as_ref(ctx).has_open_tabs());
+                    if let Some(code_view) = code_view {
+                        code_view.update(ctx, |view, ctx| view.close_active_tab(ctx));
+                        let any_left = self
+                            .active_tab_pane_group()
+                            .as_ref(ctx)
+                            .code_views(ctx)
+                            .into_iter()
+                            .any(|view| view.as_ref(ctx).has_open_tabs());
+                        if !any_left && self.active_tab_pane_group().as_ref(ctx).right_panel_open {
+                            let pane_group_handle = self.active_tab_pane_group().clone();
+                            self.close_right_panel(&pane_group_handle, ctx);
+                        }
+                        return;
+                    }
+                    if self.active_tab_pane_group().as_ref(ctx).right_panel_open {
+                        let pane_group_handle = self.active_tab_pane_group().clone();
+                        self.close_right_panel(&pane_group_handle, ctx);
+                        return;
+                    }
+                }
                 if self.left_panel_view.is_self_or_child_focused(ctx) {
                     if self.left_panel_view.as_ref(ctx).is_source_control_active() {
                         let pane_group_handle = self.active_tab_pane_group().clone();
                         self.close_right_panel(&pane_group_handle, ctx);
                     } else {
-                        self.close_left_panel(ctx);
+                        self.focus_active_tab(ctx);
                     }
                 } else if self.right_panel_view.is_self_or_child_focused(ctx) {
                     let pane_group_handle = self.active_tab_pane_group().clone();
@@ -18178,7 +18404,7 @@ impl View for Workspace {
     }
 
     fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {
-        if focus_ctx.is_self_focused() {
+        if focus_ctx.is_self_focused() && !self.has_empty_placeholder() {
             self.focus_active_tab(ctx);
         }
     }
@@ -19765,6 +19991,17 @@ pub(super) fn group_has_single_member(tabs: &[TabData], group_id: TabGroupId) ->
 /// `FeatureFlag::VerticalTabs` + `use_vertical_tabs` check the tab bar uses to
 /// decide what to render (see `render_tab_bar_contents`) — so the id always
 /// points at wherever the tab strip is actually shown.
+#[cfg(feature = "local_fs")]
+fn remote_media_cache_dir(remote_path: &warp_util::remote_path::RemotePath) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    remote_path.hash(&mut hasher);
+    std::env::temp_dir()
+        .join("spirit-remote-media")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
 pub(crate) fn active_tab_bar_position_id(app: &AppContext) -> &'static str {
     if uses_vertical_tabs(app) {
         VERTICAL_TABS_PANEL_POSITION_ID

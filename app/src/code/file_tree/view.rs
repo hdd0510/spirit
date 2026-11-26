@@ -116,6 +116,21 @@ pub enum FileTreeAction {
     Delete {
         id: FileTreeIdentifier,
     },
+    CutItem {
+        id: FileTreeIdentifier,
+    },
+    CopyItem {
+        id: FileTreeIdentifier,
+    },
+    PasteIntoItem {
+        id: FileTreeIdentifier,
+    },
+    NewFolderBelowDirectory {
+        id: FileTreeIdentifier,
+    },
+    CutSelected,
+    CopySelected,
+    PasteSelected,
     NewFileBelowDirectory {
         id: FileTreeIdentifier,
     },
@@ -164,6 +179,21 @@ pub fn init(app: &mut AppContext) {
         FixedBinding::new(
             "enter",
             FileTreeAction::ExecuteSelectedItem,
+            id!(FileTreeView::ui_name()),
+        ),
+        FixedBinding::new(
+            "cmdorctrl-x",
+            FileTreeAction::CutSelected,
+            id!(FileTreeView::ui_name()),
+        ),
+        FixedBinding::new(
+            "cmdorctrl-c",
+            FileTreeAction::CopySelected,
+            id!(FileTreeView::ui_name()),
+        ),
+        FixedBinding::new(
+            "cmdorctrl-v",
+            FileTreeAction::PasteSelected,
             id!(FileTreeView::ui_name()),
         ),
     ]);
@@ -236,7 +266,19 @@ impl RootDirectory {
     }
 }
 
+#[derive(Clone)]
+struct FileClipboard {
+    host: Option<HostId>,
+    path: String,
+    cut: bool,
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 pub struct FileTreeView {
+    file_clipboard: Option<FileClipboard>,
     /// Per-root state, keyed by root path
     root_directories: HashMap<StandardizedPath, RootDirectory>,
     /// The displayed directories
@@ -708,6 +750,7 @@ impl FileTreeView {
             repository_metadata_model,
             #[cfg(feature = "local_fs")]
             is_active: false,
+            file_clipboard: None,
             selected_item: None,
             list_state: UniformListState::new(),
             scroll_state: ScrollStateHandle::default(),
@@ -1502,8 +1545,9 @@ impl FileTreeView {
     ) {
         // User toggled expansion; supersede any pending focus-follow.
         self.pending_focus_target = None;
+        let is_displayed_expanded = self.is_folder_expanded(root_path, folder_path);
         if let Some(root_dir) = self.root_directories.get_mut(root_path) {
-            if root_dir.expanded_folders.contains(folder_path) {
+            if is_displayed_expanded {
                 root_dir.expanded_folders.remove(folder_path);
 
                 // Track explicit collapse so auto-expansion doesn't override user intent.
@@ -1531,7 +1575,11 @@ impl FileTreeView {
     fn is_folder_expanded(&self, root_path: &StandardizedPath, path: &StandardizedPath) -> bool {
         self.root_directories
             .get(root_path)
-            .map(|root_dir| root_dir.expanded_folders.contains(path))
+            .map(|root_dir| {
+                root_dir.expanded_folders.contains(path)
+                    && (root_dir.entry.get(path).is_none_or(|entry| entry.loaded())
+                        || root_dir.entry.child_paths(path).next().is_some())
+            })
             .unwrap_or(false)
     }
 
@@ -2323,11 +2371,44 @@ impl FileTreeView {
 
         let mut items = vec![];
 
+        let is_root_item = id.index == 0;
         if is_remote {
-            // Remote file trees only support a limited set of actions:
-            // copying paths and attaching as context. File opening,
-            // creation, rename, delete, cd, and reveal are unavailable
-            // because there is no local filesystem or editor support.
+            if matches!(item, FileTreeItem::DirectoryHeader { .. }) {
+                items.push(
+                    MenuItemFields::new("New folder")
+                        .with_on_select_action(FileTreeAction::NewFolderBelowDirectory {
+                            id: id.clone(),
+                        })
+                        .into_item(),
+                );
+            }
+            if !is_root_item {
+                items.push(
+                    MenuItemFields::new("Cut")
+                        .with_on_select_action(FileTreeAction::CutItem { id: id.clone() })
+                        .into_item(),
+                );
+                items.push(
+                    MenuItemFields::new("Copy")
+                        .with_on_select_action(FileTreeAction::CopyItem { id: id.clone() })
+                        .into_item(),
+                );
+            }
+            if self.file_clipboard.is_some() {
+                items.push(
+                    MenuItemFields::new("Paste")
+                        .with_on_select_action(FileTreeAction::PasteIntoItem { id: id.clone() })
+                        .into_item(),
+                );
+            }
+            if !is_root_item {
+                items.push(MenuItem::Separator);
+                items.push(
+                    MenuItemFields::new("Delete")
+                        .with_on_select_action(FileTreeAction::Delete { id: id.clone() })
+                        .into_item(),
+                );
+            }
         } else {
             match item {
                 FileTreeItem::File { .. } => {
@@ -2380,6 +2461,36 @@ impl FileTreeView {
                     );
                 }
             };
+
+            if matches!(item, FileTreeItem::DirectoryHeader { .. }) {
+                items.push(
+                    MenuItemFields::new("New folder")
+                        .with_on_select_action(FileTreeAction::NewFolderBelowDirectory {
+                            id: id.clone(),
+                        })
+                        .into_item(),
+                );
+            }
+            if !is_root_item {
+                items.push(
+                    MenuItemFields::new("Cut")
+                        .with_on_select_action(FileTreeAction::CutItem { id: id.clone() })
+                        .into_item(),
+                );
+                items.push(
+                    MenuItemFields::new("Copy")
+                        .with_on_select_action(FileTreeAction::CopyItem { id: id.clone() })
+                        .into_item(),
+                );
+            }
+            if self.file_clipboard.is_some() {
+                items.push(
+                    MenuItemFields::new("Paste")
+                        .with_on_select_action(FileTreeAction::PasteIntoItem { id: id.clone() })
+                        .into_item(),
+                );
+            }
+            items.push(MenuItem::Separator);
 
             let open_text = if cfg!(target_os = "macos") {
                 "Reveal in Finder"
@@ -2538,6 +2649,210 @@ impl FileTreeView {
         }
 
         ctx.emit(FileTreeEvent::CDToDirectory { path });
+    }
+
+    fn item_location(&self, id: &FileTreeIdentifier) -> Option<(Option<HostId>, String, bool)> {
+        let root_dir = self.root_directories.get(&id.root)?;
+        let item = root_dir.items.get(id.index)?;
+        let is_dir = matches!(item, FileTreeItem::DirectoryHeader { .. });
+        let path = if root_dir.is_remote() {
+            item.path().as_str().to_string()
+        } else {
+            item.path()
+                .to_local_path_lossy()
+                .to_string_lossy()
+                .into_owned()
+        };
+        Some((root_dir.remote_host_id.clone(), path, is_dir))
+    }
+
+    fn stage_clipboard(&mut self, id: &FileTreeIdentifier, cut: bool) {
+        if id.index == 0 {
+            return;
+        }
+        if let Some((host, path, _)) = self.item_location(id) {
+            self.file_clipboard = Some(FileClipboard { host, path, cut });
+        }
+    }
+
+    fn target_directory(&self, id: &FileTreeIdentifier) -> Option<(Option<HostId>, String)> {
+        let (host, path, is_dir) = self.item_location(id)?;
+        if is_dir {
+            return Some((host, path));
+        }
+        let parent = Path::new(&path).parent()?.to_string_lossy().into_owned();
+        Some((host, parent))
+    }
+
+    fn paste_into(&mut self, id: &FileTreeIdentifier, ctx: &mut ViewContext<Self>) {
+        let Some(clip) = self.file_clipboard.clone() else {
+            return;
+        };
+        let Some((host, dst)) = self.target_directory(id) else {
+            return;
+        };
+        if clip.host != host {
+            log::warn!("Paste across different hosts is not supported");
+            return;
+        }
+        let src_parent = Path::new(&clip.path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if clip.cut && src_parent == dst {
+            self.file_clipboard = None;
+            return;
+        }
+        if dst == clip.path || dst.starts_with(&format!("{}/", clip.path.trim_end_matches('/'))) {
+            log::warn!("Cannot paste a folder into itself");
+            return;
+        }
+        let verb = if clip.cut { "mv" } else { "cp -R" };
+        let script = format!(
+            "src={src}; dst={dst}; base=$(basename \"$src\"); t=\"$dst/$base\"; n=1; \
+             while [ -e \"$t\" ]; do if [ \"$n\" = 1 ]; then t=\"$dst/$base copy\"; else t=\"$dst/$base copy $n\"; fi; n=$((n+1)); done; \
+             {verb} \"$src\" \"$t\"",
+            src = shell_quote(&clip.path),
+            dst = shell_quote(&dst),
+        );
+        let mut refresh = vec![dst];
+        if clip.cut {
+            refresh.push(src_parent);
+            self.file_clipboard = None;
+        }
+        self.run_fs_script(host, script, id.root.clone(), refresh, ctx);
+    }
+
+    fn new_folder_in(&mut self, id: &FileTreeIdentifier, ctx: &mut ViewContext<Self>) {
+        let Some((host, dst)) = self.target_directory(id) else {
+            return;
+        };
+        let script = format!(
+            "dst={dst}; t=\"$dst/New folder\"; n=1; \
+             while [ -e \"$t\" ]; do n=$((n+1)); t=\"$dst/New folder $n\"; done; \
+             mkdir -p \"$t\"",
+            dst = shell_quote(&dst),
+        );
+        self.run_fs_script(host, script, id.root.clone(), vec![dst], ctx);
+    }
+
+    fn delete_remote_item(&mut self, id: &FileTreeIdentifier, ctx: &mut ViewContext<Self>) {
+        if id.index == 0 {
+            return;
+        }
+        let Some((host, path, _)) = self.item_location(id) else {
+            return;
+        };
+        let parent = Path::new(&path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let script = format!("rm -rf -- {}", shell_quote(&path));
+        self.run_fs_script(host, script, id.root.clone(), vec![parent], ctx);
+    }
+
+    fn run_fs_script(
+        &mut self,
+        host: Option<HostId>,
+        script: String,
+        root: StandardizedPath,
+        refresh_dirs: Vec<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::remote_server::manager::RemoteServerManager;
+
+        let sockets = host
+            .as_ref()
+            .map(|h| RemoteServerManager::as_ref(ctx).control_sockets_for_host(h))
+            .unwrap_or_default();
+        let is_remote = host.is_some();
+        ctx.spawn(
+            async move {
+                if !is_remote {
+                    let output = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&script)
+                        .output()?;
+                    if output.status.success() {
+                        return anyhow::Ok(());
+                    }
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                let remote_command = format!("sh -c {}", shell_quote(&script));
+                let mut last_error = anyhow::anyhow!("no usable SSH connection");
+                for socket_path in &sockets {
+                    match remote_server::ssh::run_ssh_command(
+                        socket_path,
+                        &remote_command,
+                        std::time::Duration::from_secs(300),
+                    )
+                    .await
+                    {
+                        Ok(output) if output.status.success() => return Ok(()),
+                        Ok(output) => {
+                            last_error =
+                                anyhow::anyhow!("{}", String::from_utf8_lossy(&output.stderr));
+                        }
+                        Err(err) => last_error = anyhow::anyhow!("{err}"),
+                    }
+                }
+                Err(last_error)
+            },
+            move |me, result, ctx| {
+                if let Err(err) = result {
+                    log::warn!("File operation failed: {err}");
+                }
+                if me
+                    .root_directories
+                    .get(&root)
+                    .is_some_and(|r| r.is_remote())
+                {
+                    for dir in refresh_dirs {
+                        me.reload_remote_dir(&root, dir, ctx);
+                    }
+                }
+                ctx.notify();
+            },
+        );
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn reload_remote_dir(
+        &self,
+        root_path: &StandardizedPath,
+        dir_path: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::remote_server::manager::RemoteServerManager;
+
+        let Some(root_dir) = self.root_directories.get(root_path) else {
+            return;
+        };
+        let repo_root = root_dir.entry.root_directory().to_string();
+        let Some(host_id) = root_dir.remote_host_id.as_ref() else {
+            return;
+        };
+        let Some(&session_id) = RemoteServerManager::as_ref(ctx)
+            .sessions_for_host(host_id)
+            .and_then(|sessions| sessions.iter().next())
+        else {
+            return;
+        };
+        RemoteServerManager::handle(ctx).update(ctx, |mgr, ctx| {
+            mgr.load_remote_repo_metadata_directory(session_id, repo_root, dir_path, ctx);
+        });
+    }
+
+    #[cfg(not(feature = "local_fs"))]
+    fn reload_remote_dir(
+        &self,
+        _root_path: &StandardizedPath,
+        _dir_path: String,
+        _ctx: &mut ViewContext<Self>,
+    ) {
     }
 
     fn rename_item(&mut self, id: &FileTreeIdentifier, ctx: &mut ViewContext<Self>) {
@@ -3121,10 +3436,43 @@ impl TypedActionView for FileTreeView {
                 self.context_menu_state.take();
             }
             FileTreeAction::Delete { id } => {
-                if !self.is_remote_item(id) {
+                if self.is_remote_item(id) {
+                    self.delete_remote_item(id, ctx);
+                } else {
                     self.delete_item(id, ctx);
                 }
                 self.context_menu_state.take();
+            }
+            FileTreeAction::CutItem { id } => {
+                self.stage_clipboard(id, true);
+                self.context_menu_state.take();
+            }
+            FileTreeAction::CopyItem { id } => {
+                self.stage_clipboard(id, false);
+                self.context_menu_state.take();
+            }
+            FileTreeAction::PasteIntoItem { id } => {
+                self.paste_into(id, ctx);
+                self.context_menu_state.take();
+            }
+            FileTreeAction::NewFolderBelowDirectory { id } => {
+                self.new_folder_in(id, ctx);
+                self.context_menu_state.take();
+            }
+            FileTreeAction::CutSelected => {
+                if let Some(id) = self.selected_item.clone() {
+                    self.stage_clipboard(&id, true);
+                }
+            }
+            FileTreeAction::CopySelected => {
+                if let Some(id) = self.selected_item.clone() {
+                    self.stage_clipboard(&id, false);
+                }
+            }
+            FileTreeAction::PasteSelected => {
+                if let Some(id) = self.selected_item.clone() {
+                    self.paste_into(&id, ctx);
+                }
             }
             FileTreeAction::DismissEditor => {
                 self.handle_pending_edit(ctx);

@@ -16,7 +16,7 @@ define_settings_group!(UndoCloseSettings, settings: [
     },
     grace_period: UndoCloseGracePeriod {
         type: Duration,
-        default: Duration::from_secs(60),
+        default: Duration::from_secs(600),
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         surface: settings::SettingSurfaces::GUI,

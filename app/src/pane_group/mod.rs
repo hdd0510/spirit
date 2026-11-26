@@ -1306,6 +1306,10 @@ impl PaneGroup {
                     ctx,
                 );
 
+                if let Some(hint) = crate::session_resume::take_restorable(&uuid.0) {
+                    terminal_view.update(ctx, |view, ctx| view.replay_resume_hint(hint, ctx));
+                }
+
                 let pane_data = TerminalPane::new(
                     uuid.0,
                     terminal_manager,

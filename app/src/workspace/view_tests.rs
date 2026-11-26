@@ -42,6 +42,7 @@ use crate::test_util::settings::initialize_settings_for_tests;
 use crate::undo_close::UndoCloseSettings;
 #[cfg(feature = "local_fs")]
 use crate::user_config::tab_configs_dir;
+use crate::util::bindings::CustomAction;
 #[cfg(windows)]
 use crate::util::traffic_lights::windows::RendererState;
 use crate::warp_managed_paths_watcher::WarpManagedPathsWatcher;
@@ -76,6 +77,9 @@ pub(crate) fn initialize_app(app: &mut App) {
     app.add_singleton_model(|_| WorkspaceToastStack);
     app.add_singleton_model(NotebookKeybindings::new);
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    app.add_singleton_model(|_| {
+        crate::terminal::cli_agent_session_history::AgentSessionHistoryModel::new()
+    });
     app.add_singleton_model(|_| crate::workspace::AgentInboxModel::default());
     app.add_singleton_model(|_| crate::code_review::GlobalCodeReviewModel);
     app.add_singleton_model(|_| SettingsPaneManager::new());
@@ -4192,6 +4196,63 @@ fn restoring_a_tab_drops_auto_pinned_agent_and_workspace_titles() {
                 Some(display_name.as_str()),
                 "the project name on a linked worktree tab was chosen by the user"
             );
+        });
+    })
+}
+
+fn close_every_tab(app: &mut App, workspace: &ViewHandle<Workspace>) {
+    workspace.update(app, |workspace, ctx| {
+        workspace.close_tab(0, true, true, ctx);
+        assert!(workspace.empty_placeholder.is_some());
+    });
+}
+
+#[test]
+fn workspace_owns_focus_after_every_tab_is_closed() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        close_every_tab(&mut app, &workspace);
+        assert!(app.read(|ctx| workspace.is_focused(ctx)));
+        workspace.update(&mut app, |workspace, ctx| workspace.focus_active_tab(ctx));
+        assert!(app.read(|ctx| workspace.is_focused(ctx)));
+    })
+}
+
+#[test]
+fn new_tab_shortcut_works_after_every_tab_is_closed() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        for _ in 0..2 {
+            close_every_tab(&mut app, &workspace);
+            let window_id = app.read(|ctx| workspace.window_id(ctx));
+            app.dispatch_custom_action(CustomAction::NewTab, window_id);
+            workspace.read(&app, |workspace, _| {
+                assert!(workspace.empty_placeholder.is_none());
+                assert_eq!(workspace.tabs.len(), 1);
+            });
+            assert!(!app.read(|ctx| workspace.is_focused(ctx)));
+        }
+    })
+}
+
+#[test]
+fn new_tab_menu_works_when_a_hidden_terminal_steals_focus() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        close_every_tab(&mut app, &workspace);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace
+                .active_tab_pane_group()
+                .update(ctx, |tab, ctx| tab.focus(ctx));
+        });
+        let window_id = app.read(|ctx| workspace.window_id(ctx));
+        app.update(|ctx| crate::app_menus::open_new_default_tab(window_id, ctx));
+        workspace.read(&app, |workspace, _| {
+            assert!(workspace.empty_placeholder.is_none());
+            assert_eq!(workspace.tabs.len(), 1);
         });
     })
 }

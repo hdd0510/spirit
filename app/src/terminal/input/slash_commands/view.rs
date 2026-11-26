@@ -5,6 +5,7 @@ use crate::search::slash_command_menu::SlashCommandId;
 use crate::terminal::input::buffer_model::InputBufferModel;
 use crate::terminal::input::inline_menu::{InlineMenuEvent, InlineMenuPositioner, InlineMenuView};
 use crate::terminal::input::slash_command_model::{SlashCommandEntryState, SlashCommandModel};
+use crate::terminal::input::slash_commands::agent_commands::agent_menu_query;
 use crate::terminal::input::slash_commands::{
     AcceptSlashCommandOrSavedPrompt, GuiSlashCommandDataSource, GuiZeroStateDataSource,
     SlashCommandMixer, UpdatedActiveCommands, build_slash_command_mixer, slash_command_query,
@@ -33,6 +34,9 @@ impl CloseReason {
 #[derive(Debug, Clone)]
 pub enum SlashCommandsEvent {
     Close(CloseReason),
+    SelectedAgentCommand {
+        text: String,
+    },
     /// `cmd_or_ctrl_enter` is true if accepted via Cmd/Ctrl+Enter (vs Enter/click).
     SelectedStaticCommand {
         id: SlashCommandId,
@@ -155,6 +159,7 @@ impl InlineSlashCommandView {
             .as_ref(ctx)
             .current_value()
             .strip_prefix('/')
+            .or_else(|| agent_menu_query(self.input_buffer_model.as_ref(ctx).current_value()))
             .map(ToOwned::to_owned)
         else {
             return;
@@ -175,6 +180,9 @@ impl InlineSlashCommandView {
         ctx: &mut ViewContext<Self>,
     ) {
         match item {
+            AcceptSlashCommandOrSavedPrompt::AgentCommand { text } => {
+                ctx.emit(SlashCommandsEvent::SelectedAgentCommand { text: text.clone() });
+            }
             AcceptSlashCommandOrSavedPrompt::SlashCommand { id } => {
                 ctx.emit(SlashCommandsEvent::SelectedStaticCommand {
                     id: *id,

@@ -245,3 +245,40 @@ pub async fn scp_upload(
         ))
     }
 }
+
+pub async fn scp_download(
+    socket_path: &Path,
+    remote_path: &str,
+    local_path: &Path,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let output = async {
+        Command::new("scp")
+            .arg("-o")
+            .arg(format!("ControlPath={}", socket_path.display()))
+            .arg("-o")
+            .arg("ControlMaster=no")
+            .arg("-o")
+            .arg("ConnectTimeout=15")
+            .arg(format!("placeholder@placeholder:{remote_path}"))
+            .arg(local_path.as_os_str())
+            .kill_on_drop(true)
+            .output()
+            .await
+    }
+    .with_timeout(timeout)
+    .await
+    .map_err(|_| anyhow!("scp timed out after {timeout:?}"))?
+    .map_err(|e| anyhow!("scp failed to execute: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(anyhow!(
+            "scp failed (exit {:?}): {}",
+            output.status.code(),
+            stderr
+        ))
+    }
+}

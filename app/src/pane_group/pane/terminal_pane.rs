@@ -231,6 +231,7 @@ impl PaneContent for TerminalPane {
     fn snapshot(&self, app: &AppContext) -> LeafContents {
         let view = self.terminal_view(app).as_ref(app);
         let is_active = view.is_active_session(app);
+        crate::session_resume::record(&self.uuid, view.session_resume_hint(app));
 
         LeafContents::Terminal(TerminalPaneSnapshot {
             uuid: self.uuid.clone(),

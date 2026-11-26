@@ -6,7 +6,7 @@ use std::rc::Rc;
 use chrono::Local;
 use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PASTE_START, C0};
 use warpui::notification::UserNotification;
-use warpui::{App, EntityIdSet, Presenter, WindowInvalidation};
+use warpui::{App, EntityIdSet, Presenter, View, WindowInvalidation};
 
 use super::*;
 use crate::code_review::agent_handoff::AgentReviewCommentBatch;
@@ -4106,6 +4106,195 @@ fn start_cli_agent_session_with_output(
     });
 }
 
+fn start_agent_with_rich_input(app: &mut App, terminal: &ViewHandle<TerminalView>) {
+    start_cli_agent_session(app, terminal, CLIAgent::Claude);
+    terminal.read(app, |view, ctx| {
+        assert!(view.has_active_cli_agent_input_session(ctx));
+    });
+}
+
+fn click_spirit_input(app: &mut App, terminal: &ViewHandle<TerminalView>) {
+    terminal.update(app, |view, ctx| {
+        view.handle_action(&TerminalAction::ClearSelectionsWhenShellMode, ctx);
+        view.input.update(ctx, |input, ctx| {
+            input.handle_action(&InputAction::FocusInputBox, ctx);
+        });
+    });
+    assert_spirit_input_focused(app, terminal);
+}
+
+fn assert_spirit_input_focused(app: &mut App, terminal: &ViewHandle<TerminalView>) {
+    terminal.read(app, |view, ctx| {
+        assert!(view.input.as_ref(ctx).editor().is_focused(ctx));
+    });
+}
+
+fn assert_agent_focused(app: &mut App, terminal: &ViewHandle<TerminalView>) {
+    let focused = app.read(|ctx| terminal.is_focused(ctx));
+    assert!(focused, "the agent's terminal should own the keyboard");
+}
+
+fn running_block_click_actions() -> (Vec<TerminalAction>, Vec<TerminalAction>) {
+    (
+        vec![
+            TerminalAction::BlockSelect {
+                action: BlockSelectAction::ClearAllBlocks,
+                should_redetermine_focus: true,
+            },
+            TerminalAction::Focus,
+            TerminalAction::CloseContextMenu,
+        ],
+        vec![
+            TerminalAction::BlockSelect {
+                action: BlockSelectAction::MouseUp {
+                    block_index: BlockIndex::zero(),
+                    is_ctrl_down: false,
+                    is_cmd_down: false,
+                    is_shift_down: false,
+                },
+                should_redetermine_focus: true,
+            },
+            TerminalAction::BlockTextSelect(BlockTextSelectAction::End),
+        ],
+    )
+}
+
+#[test]
+fn agent_start_shows_rich_input_without_taking_focus() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        start_agent_with_rich_input(&mut app, &terminal);
+        assert_agent_focused(&mut app, &terminal);
+    })
+}
+
+#[test]
+fn first_click_on_agent_takes_focus_from_rich_input() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        start_agent_with_rich_input(&mut app, &terminal);
+
+        for batched in [false, true] {
+            for _ in 0..3 {
+                click_spirit_input(&mut app, &terminal);
+                let (down, up) = running_block_click_actions();
+                for phase in [down, up] {
+                    if batched {
+                        terminal.update(&mut app, |view, ctx| {
+                            for action in &phase {
+                                view.handle_action(action, ctx);
+                            }
+                        });
+                    } else {
+                        for action in &phase {
+                            terminal.update(&mut app, |view, ctx| view.handle_action(action, ctx));
+                        }
+                    }
+                }
+                assert_agent_focused(&mut app, &terminal);
+            }
+        }
+    })
+}
+
+#[test]
+fn rich_input_keeps_focus_after_clicking_it_until_the_agent_is_clicked() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        start_agent_with_rich_input(&mut app, &terminal);
+        click_spirit_input(&mut app, &terminal);
+        terminal.update(&mut app, |view, ctx| view.redetermine_global_focus(ctx));
+        assert_spirit_input_focused(&mut app, &terminal);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_action(&TerminalAction::Focus, ctx);
+        });
+        assert_agent_focused(&mut app, &terminal);
+        terminal.update(&mut app, |view, ctx| view.redetermine_global_focus(ctx));
+        assert_agent_focused(&mut app, &terminal);
+
+        terminal.update(&mut app, |view, ctx| {
+            let editor = view.input.as_ref(ctx).editor().clone();
+            editor.update(ctx, |editor, ctx| {
+                editor.handle_action(&crate::editor::EditorAction::Focus, ctx);
+            });
+        });
+        terminal.update(&mut app, |view, ctx| view.redetermine_global_focus(ctx));
+        assert_spirit_input_focused(&mut app, &terminal);
+    })
+}
+
+#[test]
+fn escape_in_rich_input_returns_focus_to_the_agent_and_keeps_it_open() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        start_agent_with_rich_input(&mut app, &terminal);
+        click_spirit_input(&mut app, &terminal);
+        terminal.update(&mut app, |view, ctx| {
+            view.input.update(ctx, |_, ctx| {
+                ctx.emit(InputEvent::CloseCLIAgentRichInput);
+            });
+        });
+        assert_agent_focused(&mut app, &terminal);
+        terminal.read(&app, |view, ctx| {
+            assert!(view.has_active_cli_agent_input_session(ctx));
+        });
+    })
+}
+
+#[test]
+fn keys_and_paste_reach_the_agent_while_it_has_focus() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        start_agent_with_rich_input(&mut app, &terminal);
+        let pty_writes = record_pty_writes(&mut app, &terminal);
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_action(&TerminalAction::KeyDown("\r".to_owned()), ctx);
+            view.handle_action(&TerminalAction::Down, ctx);
+            ctx.clipboard()
+                .write(ClipboardContent::plain_text("pasted".to_owned()));
+            view.handle_action(&TerminalAction::Paste, ctx);
+            view.ctrl_d(ctx);
+        });
+        let written = pty_writes.borrow().concat();
+        assert_eq!(written, b"\r\x1b[Bpasted\x04".to_vec());
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "");
+        });
+    })
+}
+
+#[test]
+fn mouse_reporting_click_takes_focus_from_rich_input() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        start_agent_with_rich_input(&mut app, &terminal);
+        click_spirit_input(&mut app, &terminal);
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_action(
+                &TerminalAction::AltMouseAction(
+                    MouseState::new(MouseButton::Left, MouseAction::Pressed, Default::default())
+                        .set_point(Point::new(0, 0)),
+                ),
+                ctx,
+            );
+        });
+        assert_agent_focused(&mut app, &terminal);
+    })
+}
+
 fn record_pty_writes(
     app: &mut App,
     terminal: &ViewHandle<TerminalView>,
@@ -4152,10 +4341,6 @@ fn opening_cli_agent_rich_input_shows_the_input_box_and_hides_the_standalone_foo
         let terminal = add_window_with_terminal(&mut app, None);
         start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
 
-        terminal.update(&mut app, |view, ctx| {
-            view.handle_action(&TerminalAction::ToggleCLIAgentRichInput, ctx);
-        });
-
         terminal.read(&app, |view, ctx| {
             assert!(view.has_active_cli_agent_input_session(ctx));
             let model = view.model.lock();
@@ -4177,10 +4362,6 @@ fn rich_input_opens_for_an_agent_added_to_the_launcher_catalog() {
         let terminal = add_window_with_terminal(&mut app, None);
         start_cli_agent_session(&mut app, &terminal, CLIAgent::Cline);
 
-        terminal.update(&mut app, |view, ctx| {
-            view.handle_action(&TerminalAction::ToggleCLIAgentRichInput, ctx);
-        });
-
         terminal.read(&app, |view, ctx| {
             assert!(view.has_active_cli_agent_input_session(ctx));
         });
@@ -4197,7 +4378,6 @@ fn rich_input_submits_as_a_bracketed_paste_when_the_agents_tui_asks_for_one() {
         let pty_writes = record_pty_writes(&mut app, &terminal);
 
         terminal.update(&mut app, |view, ctx| {
-            view.handle_action(&TerminalAction::ToggleCLIAgentRichInput, ctx);
             view.submit_cli_agent_rich_input("write a test".to_owned(), ctx);
         });
 
@@ -4222,7 +4402,6 @@ fn rich_input_submits_the_carriage_return_separately_without_bracketed_paste() {
         let pty_writes = record_pty_writes(&mut app, &terminal);
 
         terminal.update(&mut app, |view, ctx| {
-            view.handle_action(&TerminalAction::ToggleCLIAgentRichInput, ctx);
             view.submit_cli_agent_rich_input("write a test".to_owned(), ctx);
         });
 
@@ -4243,9 +4422,6 @@ fn closing_cli_agent_rich_input_saves_a_draft_that_reopening_restores() {
         start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
 
         terminal.update(&mut app, |view, ctx| {
-            view.handle_action(&TerminalAction::ToggleCLIAgentRichInput, ctx);
-        });
-        terminal.update(&mut app, |view, ctx| {
             view.input.update(ctx, |input, ctx| {
                 input.replace_buffer_content("refactor the parser", ctx);
             });
@@ -4253,7 +4429,6 @@ fn closing_cli_agent_rich_input_saves_a_draft_that_reopening_restores() {
         terminal.update(&mut app, |view, ctx| {
             view.handle_action(&TerminalAction::ToggleCLIAgentRichInput, ctx);
         });
-
         terminal.read(&app, |view, ctx| {
             assert!(!view.has_active_cli_agent_input_session(ctx));
             assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "");
@@ -4291,7 +4466,6 @@ fn submitting_cli_agent_rich_input_writes_the_prompt_then_a_carriage_return() {
         });
 
         terminal.update(&mut app, |view, ctx| {
-            view.handle_action(&TerminalAction::ToggleCLIAgentRichInput, ctx);
             view.submit_cli_agent_rich_input("write a test".to_owned(), ctx);
         });
 
@@ -4326,4 +4500,452 @@ fn cli_agent_footer_chip_kinds_keep_diff_stats_left_and_context_right() {
             ContextChipKind::ShellGitBranch,
         ]
     );
+}
+
+const CLAUDE_BORDER: &str = "\x1b[38;2;136;136;136m────────────────────\x1b[39m";
+
+fn claude_screen(prompt: &str) -> String {
+    format!(
+        "\x1b[2J\x1b[H● Fixed.\r\n\r\n{CLAUDE_BORDER}\r\n\x1b[39m{prompt}\r\n{CLAUDE_BORDER}\r\n  ? for shortcuts\x1b[4;3H"
+    )
+}
+
+fn add_wide_terminal(app: &mut App) -> ViewHandle<TerminalView> {
+    let terminal = add_window_with_terminal(app, None);
+    terminal.update(app, |view, ctx| {
+        view.after_terminal_view_layout(vec2f(1600., 900.), ctx);
+        assert!(view.size_info.columns >= 60, "{}", view.size_info.columns);
+    });
+    terminal
+}
+
+fn draw_agent_screen(app: &mut App, terminal: &ViewHandle<TerminalView>, prompt: &str) {
+    terminal.update(app, |view, ctx| {
+        view.model
+            .lock()
+            .process_bytes(claude_screen(prompt).as_str());
+        view.handle_terminal_wakeup((), ctx);
+    });
+}
+
+fn ghost_text(app: &mut App, terminal: &ViewHandle<TerminalView>) -> Option<String> {
+    terminal.read(app, |view, ctx| {
+        view.input
+            .as_ref(ctx)
+            .editor()
+            .as_ref(ctx)
+            .current_autosuggestion_text()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn assert_ghost_text(
+    app: &mut App,
+    agent: CLIAgent,
+    alt: bool,
+    prompt: &str,
+    expected: Option<&str>,
+) {
+    let terminal = add_wide_terminal(app);
+    start_cli_agent_session(app, &terminal, agent);
+    if alt {
+        terminal.update(app, |view, _| {
+            view.model.lock().set_mode(ansi::Mode::SwapScreen {
+                save_cursor_and_clear_screen: true,
+            });
+        });
+    }
+    draw_agent_screen(app, &terminal, prompt);
+    assert_eq!(
+        ghost_text(app, &terminal).as_deref(),
+        expected,
+        "{agent:?} alt={alt} {prompt:?}"
+    );
+}
+
+const CLAUDE_SUGGESTION: &str = "❯\u{a0}\x1b[2myes write the tests\x1b[0m";
+
+#[test]
+fn claude_suggestion_is_mirrored_into_the_rich_input() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        for alt in [false, true] {
+            for (prompt, expected) in [
+                (CLAUDE_SUGGESTION, Some("yes write the tests")),
+                (
+                    "❯\u{a0}\x1b[2mviết test cho hàm này\x1b[0m",
+                    Some("viết test cho hàm này"),
+                ),
+                ("❯\u{a0}\x1b[7my\x1b[27m\x1b[2mes\x1b[0m", Some("yes")),
+                (
+                    "❯\u{a0}\x1b[2mwrite the\x1b[0m\r\n  \x1b[2mtests\x1b[0m",
+                    Some("write the tests"),
+                ),
+            ] {
+                assert_ghost_text(&mut app, CLIAgent::Claude, alt, prompt, expected);
+            }
+        }
+    })
+}
+
+#[test]
+fn only_a_claude_suggestion_is_mirrored() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        for prompt in [
+            "❯\u{a0}",
+            "❯\u{a0}typed by the user",
+            "❯\u{a0}typed\x1b[2m argument hint\x1b[0m",
+            "❯\u{a0}\x1b[2mTry \"how do I log an error?\"\x1b[0m",
+            "❯\u{a0}\x1b[2mPress up to edit queued messages\x1b[0m",
+            "❯\u{a0}\x1b[2mcut off…\x1b[0m",
+            "❯\u{a0}\x1b[2mwrite the\x1b[0m\r\n\x1b[2mtests\x1b[0m",
+            "❯ \x1b[38;2;177;185;249mNo, exit\x1b[39m",
+        ] {
+            assert_ghost_text(&mut app, CLIAgent::Claude, true, prompt, None);
+        }
+        assert_ghost_text(&mut app, CLIAgent::Codex, true, CLAUDE_SUGGESTION, None);
+    })
+}
+
+#[test]
+fn a_shell_without_claude_gets_no_suggestion() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        terminal.update(&mut app, |view, _| {
+            view.model.lock().simulate_long_running_block("cat", "");
+        });
+        draw_agent_screen(&mut app, &terminal, CLAUDE_SUGGESTION);
+        assert_eq!(ghost_text(&mut app, &terminal), None);
+    })
+}
+
+#[test]
+fn claude_suggestion_follows_claude_and_leaves_typed_text_alone() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
+
+        draw_agent_screen(&mut app, &terminal, CLAUDE_SUGGESTION);
+        assert!(ghost_text(&mut app, &terminal).is_some());
+        draw_agent_screen(&mut app, &terminal, "❯\u{a0}");
+        assert_eq!(ghost_text(&mut app, &terminal), None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.input.update(ctx, |input, ctx| {
+                input.replace_buffer_content("my text", ctx)
+            });
+        });
+        draw_agent_screen(&mut app, &terminal, CLAUDE_SUGGESTION);
+        assert_eq!(ghost_text(&mut app, &terminal), None);
+        terminal.update(&mut app, |view, ctx| {
+            view.input
+                .update(ctx, |input, ctx| input.replace_buffer_content("", ctx));
+        });
+        draw_agent_screen(&mut app, &terminal, CLAUDE_SUGGESTION);
+        assert_eq!(
+            ghost_text(&mut app, &terminal).as_deref(),
+            Some("yes write the tests")
+        );
+
+        terminal.update(&mut app, |view, ctx| {
+            view.submit_cli_agent_rich_input("other".to_owned(), ctx);
+        });
+        draw_agent_screen(&mut app, &terminal, CLAUDE_SUGGESTION);
+        assert_eq!(ghost_text(&mut app, &terminal), None);
+        draw_agent_screen(&mut app, &terminal, "❯\u{a0}");
+        draw_agent_screen(&mut app, &terminal, CLAUDE_SUGGESTION);
+        assert!(ghost_text(&mut app, &terminal).is_some());
+
+        terminal.update(&mut app, |view, ctx| {
+            let view_id = view.view_id;
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.remove_session(view_id, ctx);
+            });
+        });
+        assert_eq!(ghost_text(&mut app, &terminal), None);
+    })
+}
+
+#[test]
+fn tab_accepts_the_claude_suggestion() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
+        draw_agent_screen(&mut app, &terminal, CLAUDE_SUGGESTION);
+        terminal.update(&mut app, |view, ctx| {
+            view.input.update(ctx, |input, ctx| {
+                input
+                    .editor()
+                    .clone()
+                    .update(ctx, |editor, ctx| editor.handle_tab(ctx));
+            });
+        });
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(
+                view.input.as_ref(ctx).buffer_text(ctx),
+                "yes write the tests"
+            );
+        });
+    })
+}
+
+#[test]
+fn footer_button_hides_and_restores_the_rich_input_for_any_agent() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        for agent in [CLIAgent::Claude, CLIAgent::Codex] {
+            let terminal = add_wide_terminal(&mut app);
+            start_cli_agent_session(&mut app, &terminal, agent);
+            terminal.update(&mut app, |view, ctx| {
+                view.input.update(ctx, |input, ctx| {
+                    input.replace_buffer_content("draft", ctx);
+                });
+            });
+            for _ in 0..2 {
+                toggle_rich_input_from_footer(&mut app, &terminal);
+                terminal.read(&app, |view, ctx| {
+                    assert!(!view.has_active_cli_agent_input_session(ctx));
+                    assert!(view.should_render_cli_agent_footer(ctx));
+                });
+                assert_agent_focused(&mut app, &terminal);
+
+                toggle_rich_input_from_footer(&mut app, &terminal);
+                terminal.read(&app, |view, ctx| {
+                    assert!(view.has_active_cli_agent_input_session(ctx));
+                    assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "draft");
+                });
+                assert_spirit_input_focused(&mut app, &terminal);
+            }
+        }
+    })
+}
+
+#[test]
+fn closing_the_rich_input_drops_the_claude_suggestion_and_reopening_restores_it() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
+        draw_agent_screen(&mut app, &terminal, CLAUDE_SUGGESTION);
+        toggle_rich_input_from_footer(&mut app, &terminal);
+        assert_eq!(ghost_text(&mut app, &terminal), None);
+        toggle_rich_input_from_footer(&mut app, &terminal);
+        assert_eq!(
+            ghost_text(&mut app, &terminal).as_deref(),
+            Some("yes write the tests")
+        );
+    })
+}
+
+fn toggle_rich_input_from_footer(app: &mut App, terminal: &ViewHandle<TerminalView>) {
+    let footer = terminal.read(app, |view, _| view.cli_agent_footer.clone());
+    footer.update(app, |footer, ctx| {
+        footer.handle_action(
+            &cli_agent_footer::CliAgentFooterAction::ToggleRichInput,
+            ctx,
+        );
+    });
+}
+
+fn type_into_spirit_input(app: &mut App, terminal: &ViewHandle<TerminalView>, text: &str) {
+    terminal.update(app, |view, ctx| {
+        view.input.update(ctx, |input, ctx| {
+            input.replace_buffer_content(text, ctx);
+        });
+    });
+}
+
+fn set_agent_commands(app: &mut App, terminal: &ViewHandle<TerminalView>, commands: &[&str]) {
+    let commands = commands
+        .iter()
+        .map(
+            |text| crate::terminal::input::slash_commands::agent_commands::AgentCommand {
+                text: (*text).to_owned(),
+                description: String::new(),
+            },
+        )
+        .collect();
+    terminal.update(app, |view, ctx| {
+        view.input.update(ctx, |input, ctx| {
+            input
+                .slash_command_data_source_for_test()
+                .update(ctx, |source, ctx| source.set_agent_commands(commands, ctx));
+        });
+    });
+}
+
+fn is_agent_menu_open(app: &mut App, terminal: &ViewHandle<TerminalView>) -> bool {
+    terminal.read(app, |view, ctx| {
+        view.input
+            .as_ref(ctx)
+            .suggestions_mode_model()
+            .as_ref(ctx)
+            .is_slash_commands()
+    })
+}
+
+#[test]
+fn slash_menu_offers_agent_commands_and_enter_fills_the_input() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
+        set_agent_commands(&mut app, &terminal, &["/model", "/compact"]);
+
+        type_into_spirit_input(&mut app, &terminal, "/mod");
+        assert!(is_agent_menu_open(&mut app, &terminal));
+        terminal.update(&mut app, |view, ctx| {
+            view.input.update(ctx, |input, ctx| input.input_enter(ctx));
+        });
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "/model ");
+        });
+        assert!(!is_agent_menu_open(&mut app, &terminal));
+        type_into_spirit_input(&mut app, &terminal, "/compact");
+        terminal.update(&mut app, |view, ctx| {
+            view.input.update(ctx, |input, ctx| input.input_enter(ctx));
+        });
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "");
+        });
+        type_into_spirit_input(&mut app, &terminal, "/model opus");
+        assert!(!is_agent_menu_open(&mut app, &terminal));
+    })
+}
+
+#[test]
+fn slash_menu_opens_when_agent_commands_arrive_late() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
+        type_into_spirit_input(&mut app, &terminal, "/mod");
+        set_agent_commands(&mut app, &terminal, &["/model"]);
+        assert!(is_agent_menu_open(&mut app, &terminal));
+    })
+}
+
+#[test]
+fn submitting_a_panel_command_hands_the_keyboard_to_the_agent() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
+        for (text, agent_focused) in [("/model ", true), ("/compact", false)] {
+            click_spirit_input(&mut app, &terminal);
+            terminal.update(&mut app, |view, ctx| {
+                view.submit_cli_agent_rich_input(text.to_owned(), ctx);
+            });
+            if agent_focused {
+                assert_agent_focused(&mut app, &terminal);
+            } else {
+                assert_spirit_input_focused(&mut app, &terminal);
+            }
+        }
+    })
+}
+
+#[test]
+fn dollar_picks_a_skill_in_the_middle_of_a_codex_prompt() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        start_cli_agent_session(&mut app, &terminal, CLIAgent::Codex);
+        set_agent_commands(&mut app, &terminal, &["/model", "$ship"]);
+        type_into_spirit_input(&mut app, &terminal, "please $sh");
+        assert!(is_agent_menu_open(&mut app, &terminal));
+        terminal.update(&mut app, |view, ctx| {
+            view.input.update(ctx, |input, ctx| input.input_enter(ctx));
+        });
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "please $ship ");
+        });
+        assert!(!is_agent_menu_open(&mut app, &terminal));
+    })
+}
+
+#[test]
+fn ctrl_g_hides_the_rich_input_from_inside_it_without_the_edit_menu_taking_it() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(crate::settings::import::model::ImportedConfigModel::new);
+        app.update(crate::editor::init);
+        app.update(crate::terminal::input::init);
+        app.update(crate::terminal::view::init::init);
+        let _rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_wide_terminal(&mut app);
+        start_cli_agent_session(&mut app, &terminal, CLIAgent::Claude);
+        terminal.update(&mut app, |view, ctx| view.open_cli_agent_rich_input(ctx));
+
+        let window_id = app.read(|ctx| terminal.window_id(ctx));
+        let (input, editor) = terminal.read(&app, |view, ctx| {
+            assert!(view.has_active_cli_agent_input_session(ctx));
+            (view.input.clone(), view.input.as_ref(ctx).editor().clone())
+        });
+        let next_occurrence_binding = |app: &App| {
+            app.read(|ctx| {
+                let contexts = vec![
+                    View::keymap_context(terminal.as_ref(ctx), ctx),
+                    View::keymap_context(input.as_ref(ctx), ctx),
+                    View::keymap_context(editor.as_ref(ctx), ctx),
+                ];
+                ctx.binding_for_custom_action(
+                    crate::util::bindings::CustomAction::AddNextOccurrence.into(),
+                    contexts,
+                )
+                .is_some()
+            })
+        };
+        assert!(!next_occurrence_binding(&app));
+
+        let handled = app
+            .dispatch_keystroke(
+                window_id,
+                &[terminal.id(), input.id(), editor.id()],
+                &warpui::keymap::Keystroke::parse("ctrl-g").unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(handled);
+        terminal.read(&app, |view, ctx| {
+            assert!(!view.has_active_cli_agent_input_session(ctx));
+        });
+        assert!(next_occurrence_binding(&app));
+    })
+}
+
+#[test]
+fn stretched_rows_fill_the_height_without_changing_the_grid() {
+    let size = SizeInfo::new(
+        vec2f(800., 879.6),
+        8.0.into_pixels(),
+        16.0.into_pixels(),
+        16.0.into_pixels(),
+        1.6.into_pixels(),
+    );
+    let stretched = super::stretch_rows_to_fill_height(size);
+    assert_eq!(stretched.rows, size.rows);
+    assert_eq!(stretched.columns, size.columns);
+    let fill_height = 879.6 - 2. * stretched.padding_y_px().as_f32();
+    let filled = stretched.cell_height_px.as_f32() * stretched.rows as f32;
+    assert!((filled - fill_height).abs() < 0.2, "{filled}");
+    let drawn_rows = (fill_height / stretched.cell_height_px.as_f32()).floor() as usize;
+    assert_eq!(drawn_rows, stretched.rows);
+    assert!(stretched.cell_height_px.as_f32() < 16.4);
 }

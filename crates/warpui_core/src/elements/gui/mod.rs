@@ -32,6 +32,7 @@ mod stack;
 pub mod table;
 mod text;
 mod uniform_list;
+mod video;
 mod viewported_list;
 
 use core::fmt;
@@ -79,6 +80,7 @@ pub use table::{
 };
 pub use text::*;
 pub use uniform_list::*;
+pub use video::*;
 pub use viewported_list::*;
 
 use crate::Gradient;

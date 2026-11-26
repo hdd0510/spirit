@@ -68,3 +68,39 @@ fn test_click_through_layer_does_not_cover_lower_layers() {
 
     assert!(!scene.is_covered(Point::new(10., 10., ZIndex::new(0))));
 }
+
+#[test]
+fn video_is_covered_only_by_visible_content_above_it() {
+    use std::path::PathBuf;
+
+    use pathfinder_color::ColorU;
+    use pathfinder_geometry::rect::RectF;
+
+    use crate::geometry::vector::vec2f;
+
+    let video = RectF::new(vec2f(100., 100.), vec2f(200., 100.));
+    let is_covered = |rect: RectF, color: ColorU, above: bool| {
+        let mut scene = Scene::new(1., Default::default());
+        if !above {
+            scene
+                .draw_rect_with_hit_recording(rect)
+                .with_background(color);
+        }
+        scene.draw_video(video, PathBuf::from("/a.mp4"));
+        if above {
+            scene.start_overlay_layer(ClipBounds::None);
+            scene
+                .draw_rect_with_hit_recording(rect)
+                .with_background(color);
+            scene.stop_layer();
+        }
+        let covered = scene.videos().next().unwrap().1;
+        covered
+    };
+    let menu = RectF::new(vec2f(150., 80.), vec2f(50., 50.));
+    let neighbor = RectF::new(vec2f(300., 100.), vec2f(50., 100.));
+    assert!(is_covered(menu, ColorU::black(), true));
+    assert!(!is_covered(menu, ColorU::transparent_black(), true));
+    assert!(!is_covered(neighbor, ColorU::black(), true));
+    assert!(!is_covered(menu, ColorU::black(), false));
+}

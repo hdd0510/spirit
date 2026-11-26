@@ -58,6 +58,9 @@ warp_core = { workspace = true, features = ["test-util"] }
 diesel = { version = "2.2.4", features = ["sqlite", "chrono"] }
 sysinfo.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["user", "signal"] }
 

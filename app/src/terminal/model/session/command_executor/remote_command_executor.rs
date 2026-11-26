@@ -1,11 +1,13 @@
 use std::any::Any;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use command::r#async::Command;
 use itertools::Itertools as _;
+use tokio::sync::Semaphore;
 
 use super::shared::shell_escape_single_quotes;
 use super::{CommandExecutor, CommandOutput, ExecuteCommandOptions};
@@ -28,6 +30,21 @@ impl RemoteCommandExecutor {
             wsl_distro,
         }
     }
+}
+
+const MAX_COMMANDS_PER_CONTROL_MASTER: usize = 4;
+
+static CONTROL_MASTER_SLOTS: LazyLock<Mutex<HashMap<PathBuf, Arc<Semaphore>>>> =
+    LazyLock::new(Default::default);
+
+fn control_master_slots(control_socket_path: &Path) -> Arc<Semaphore> {
+    let mut slots = CONTROL_MASTER_SLOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slots
+        .entry(control_socket_path.to_path_buf())
+        .or_insert_with(|| Arc::new(Semaphore::new(MAX_COMMANDS_PER_CONTROL_MASTER)))
+        .clone()
 }
 
 #[async_trait]
@@ -96,6 +113,8 @@ impl CommandExecutor for RemoteCommandExecutor {
         };
 
         command.args(ssh_args);
+        let slots = control_master_slots(&self.control_socket_path);
+        let _slot = slots.acquire().await.map_err(|e| anyhow!(e))?;
         command
             .kill_on_drop(true)
             .output()
@@ -116,3 +135,7 @@ impl CommandExecutor for RemoteCommandExecutor {
         false
     }
 }
+
+#[cfg(test)]
+#[path = "remote_command_executor_tests.rs"]
+mod tests;

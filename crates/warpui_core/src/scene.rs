@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ordered_float::OrderedFloat;
@@ -21,9 +22,16 @@ pub struct Scene {
     active_layer_index_stack: Vec1<ZIndex>,
     layers: Vec1<Layer>,
     overlay_layers: Vec<Layer>,
+    videos: Vec<(ZIndex, VideoPlacement)>,
     #[cfg(debug_assertions)]
     /// Custom panic location, set with [`Scene::set_location_for_panic_logging`]
     panic_location: Option<&'static std::panic::Location<'static>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoPlacement {
+    pub path: PathBuf,
+    pub bounds: RectF,
 }
 
 #[derive(Clone, Default)]
@@ -54,6 +62,22 @@ pub enum ClipBounds {
 }
 
 impl Layer {
+    fn paints_over(&self, bounds: RectF) -> bool {
+        self.rects.iter().any(|rect| {
+            let is_visible = match rect.background {
+                Fill::None => false,
+                Fill::Solid(color) => color.a > 0,
+                Fill::Gradient { .. } => true,
+            };
+            is_visible
+                && self
+                    .clip_bounds
+                    .map_or(Some(rect.bounds), |clip| rect.bounds.intersection(clip))
+                    .and_then(|visible| visible.intersection(bounds))
+                    .is_some_and(|overlap| overlap.width() > 1. && overlap.height() > 1.)
+        })
+    }
+
     fn record_hit_rect(&mut self, rect: RectF) {
         if let Some(intersected) = self
             .clip_bounds
@@ -375,6 +399,7 @@ impl Scene {
             active_layer_index_stack: vec1![ZIndex::Normal(0)],
             layers: vec1![Layer::default()],
             overlay_layers: Vec::new(),
+            videos: Vec::new(),
             #[cfg(debug_assertions)]
             panic_location: None,
         }
@@ -607,6 +632,31 @@ impl Scene {
             corner_radius,
         });
         layer.record_hit_rect(rect);
+    }
+
+    pub fn draw_video(&mut self, bounds: RectF, path: PathBuf) {
+        let z_index = self.z_index();
+        self.videos.push((z_index, VideoPlacement { path, bounds }));
+    }
+
+    pub fn videos(&self) -> impl Iterator<Item = (&VideoPlacement, bool)> {
+        self.videos.iter().map(|(z_index, video)| {
+            let covered = self
+                .layers_above(*z_index)
+                .any(|layer| layer.paints_over(video.bounds));
+            (video, covered)
+        })
+    }
+
+    fn layers_above(&self, z_index: ZIndex) -> impl Iterator<Item = &Layer> {
+        let (normal, overlay) = match z_index {
+            ZIndex::Normal(index) => (index + 1, 0),
+            ZIndex::Overlay(index) => (self.layers.len(), index + 1),
+        };
+        self.layers
+            .iter()
+            .skip(normal)
+            .chain(self.overlay_layers.iter().skip(overlay))
     }
 
     pub fn draw_icon(&mut self, rect: RectF, asset: Arc<StaticImage>, opacity: f32, color: ColorU) {

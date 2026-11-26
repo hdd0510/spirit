@@ -81,6 +81,19 @@ pub fn renders_in_warp_notebook_viewer(path: impl AsRef<Path>) -> bool {
         || (FeatureFlag::JupyterNotebookRendering.is_enabled() && is_jupyter_notebook_file(path))
 }
 
+pub fn is_video_file(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "mp4" | "mkv" | "mov" | "webm" | "avi" | "m4v" | "flv" | "wmv" | "ogv"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub fn is_supported_image_file(path: impl AsRef<Path>) -> bool {
     path.as_ref()
         .extension()

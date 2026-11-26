@@ -1895,7 +1895,10 @@ fn render_groups(
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, tab)| !is_settings_tab(tab, app))
+            .filter(|(_, tab)| {
+                !is_settings_tab(tab, app)
+                    && workspace.empty_placeholder != Some(tab.pane_group.id())
+            })
             .map(|(tab_index, _)| (tab_index, None))
             .collect()
     } else {
@@ -1904,7 +1907,10 @@ fn render_groups(
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, tab)| !is_settings_tab(tab, app))
+            .filter(|(_, tab)| {
+                !is_settings_tab(tab, app)
+                    && workspace.empty_placeholder != Some(tab.pane_group.id())
+            })
             .filter_map(|(tab_index, tab)| {
                 let pane_group = tab.pane_group.as_ref(app);
                 let visible_pane_ids = pane_group.visible_pane_ids();
@@ -6781,13 +6787,23 @@ fn pane_ids_for_display_granularity(
     focused_pane_id: PaneId,
     granularity: VerticalTabsDisplayGranularity,
 ) -> Vec<PaneId> {
+    let has_terminal = visible_pane_ids
+        .iter()
+        .any(|pane_id| pane_id.pane_type() == IPaneType::Terminal);
+    let session_pane_ids: Vec<PaneId> = visible_pane_ids
+        .iter()
+        .copied()
+        .filter(|pane_id| {
+            !has_terminal || !matches!(pane_id.pane_type(), IPaneType::Code | IPaneType::File)
+        })
+        .collect();
     match granularity {
-        VerticalTabsDisplayGranularity::Panes => visible_pane_ids.to_vec(),
-        VerticalTabsDisplayGranularity::Tabs => visible_pane_ids
+        VerticalTabsDisplayGranularity::Panes => session_pane_ids,
+        VerticalTabsDisplayGranularity::Tabs => session_pane_ids
             .iter()
             .copied()
             .find(|pane_id| *pane_id == focused_pane_id)
-            .or_else(|| visible_pane_ids.first().copied())
+            .or_else(|| session_pane_ids.first().copied())
             .into_iter()
             .collect(),
     }

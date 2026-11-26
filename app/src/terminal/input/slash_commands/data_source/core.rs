@@ -19,6 +19,9 @@ use crate::terminal::input::slash_command_model::{
     DetectedCommand, ParsedSlashCommandInput, slash_command_composition_filter,
 };
 use crate::terminal::input::slash_commands::AcceptSlashCommandOrSavedPrompt;
+use crate::terminal::input::slash_commands::agent_commands::{
+    AgentCommand, agent_menu_query, rank_agent_command,
+};
 use crate::terminal::model::session::SessionType;
 use crate::terminal::model::session::active_session::{ActiveSession, ActiveSessionEvent};
 
@@ -90,6 +93,7 @@ pub struct SlashCommandDataSourceState {
     terminal_view_id: EntityId,
     active_commands_by_id: HashMap<SlashCommandId, StaticCommand>,
     active_repo_root: Option<PathBuf>,
+    pub(super) agent_commands: Vec<AgentCommand>,
 }
 impl SlashCommandDataSourceState {
     pub(super) fn new(
@@ -101,6 +105,7 @@ impl SlashCommandDataSourceState {
             terminal_view_id,
             active_commands_by_id: HashMap::new(),
             active_repo_root: None,
+            agent_commands: vec![],
         }
     }
 }
@@ -129,10 +134,24 @@ pub trait SlashCommandDataSource {
 
     /// Classifies slash command input consistently across GUI and TUI surfaces.
     fn parse_input(&self, buffer: &str, ctx: &AppContext) -> ParsedSlashCommandInput {
+        if self.is_cli_agent_input_open(ctx) {
+            let has_skills = || {
+                self.active_agent_commands(ctx)
+                    .iter()
+                    .any(|command| command.text.starts_with('$'))
+            };
+            return match agent_menu_query(buffer) {
+                Some(query) if !query.starts_with('$') || has_skills() => {
+                    ParsedSlashCommandInput::Composing {
+                        filter: query.to_owned(),
+                    }
+                }
+                _ => ParsedSlashCommandInput::None,
+            };
+        }
         if !buffer.starts_with('/') {
             return ParsedSlashCommandInput::None;
         }
-        let _ = ctx;
         if let Some(detected) = self.parse_slash_command(buffer) {
             return ParsedSlashCommandInput::SlashCommand(detected);
         }
@@ -329,6 +348,25 @@ pub trait SlashCommandDataSource {
                     ),
             );
         }
+        for command in self.active_agent_commands(app) {
+            let Some(rank) = rank_agent_command(command, query_text) else {
+                continue;
+            };
+            let name_match = SlashCommandFuzzyMatchResult::try_match(
+                query_text.trim_start_matches('$'),
+                &command.text,
+                None,
+            )
+            .and_then(|result| result.name_match_result);
+            results.push(
+                InlineItem::from_agent_command(command, app)
+                    .with_name_match_result(name_match)
+                    .with_score(
+                        OrderedFloat(100. - f64::from(rank)) * SCORE_MULTIPLIER
+                            + OrderedFloat(1. / command.text.len() as f64),
+                    ),
+            );
+        }
         results
     }
 
@@ -343,7 +381,21 @@ pub trait SlashCommandDataSource {
         self.active_commands()
             .sorted_by_key(|(_, command)| std::cmp::Reverse(&command.name))
             .map(|(id, command)| InlineItem::from_slash_command(id, command, app))
+            .chain(
+                self.active_agent_commands(app)
+                    .iter()
+                    .sorted_by(|a, b| b.text.cmp(&a.text))
+                    .map(|command| InlineItem::from_agent_command(command, app)),
+            )
             .collect()
+    }
+
+    fn active_agent_commands(&self, ctx: &AppContext) -> &[AgentCommand] {
+        if self.is_cli_agent_input_open(ctx) {
+            &self.state().agent_commands
+        } else {
+            &[]
+        }
     }
 }
 
@@ -356,7 +408,7 @@ pub trait SlashCommandDataSource {
 /// a proportionally smaller bonus.
 fn prefix_match_bonus(query: &str, name: &str) -> f64 {
     let name_lower = name.to_lowercase();
-    let name_stripped = name_lower.strip_prefix('/').unwrap_or(&name_lower);
+    let name_stripped = name_lower.trim_start_matches(['/', '$']);
     if name_stripped.starts_with(query) {
         // coverage = 1.0 for exact match, smaller for partial prefix match.
         let coverage = query.len() as f64 / name_stripped.len() as f64;
@@ -396,6 +448,22 @@ impl InlineItem {
             description_match_result: None,
             score: OrderedFloat(f64::MIN),
             compact_layout: false,
+        }
+    }
+
+    pub(super) fn from_agent_command(command: &AgentCommand, app: &AppContext) -> Self {
+        Self {
+            action: AcceptSlashCommandOrSavedPrompt::AgentCommand {
+                text: command.text.clone(),
+            },
+            icon_path: Some("bundled/svg/slash.svg"),
+            name: command.text.clone(),
+            description: (!command.description.is_empty()).then(|| command.description.clone()),
+            font_family: Appearance::as_ref(app).monospace_font_family(),
+            name_match_result: None,
+            description_match_result: None,
+            score: OrderedFloat(f64::MIN),
+            compact_layout: true,
         }
     }
 

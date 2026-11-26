@@ -1,3 +1,4 @@
+pub mod agent_commands;
 mod data_source;
 mod mixer;
 mod search_item;
@@ -35,6 +36,7 @@ use crate::workspace::{ToastStack, WorkspaceAction};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptSlashCommandOrSavedPrompt {
     SlashCommand { id: SlashCommandId },
+    AgentCommand { text: String },
 }
 impl InlineMenuAction for AcceptSlashCommandOrSavedPrompt {
     const MENU_TYPE: InlineMenuType = InlineMenuType::SlashCommands;
@@ -252,6 +254,13 @@ impl Input {
                     model.set_mode(InputSuggestionsMode::Closed, ctx);
                 });
                 ctx.notify();
+            }
+            SlashCommandsEvent::SelectedAgentCommand { text } => {
+                let text = agent_commands::insert_agent_command(&self.buffer_text(ctx), text);
+                self.editor.update(ctx, |editor, ctx| {
+                    editor.set_buffer_text(&text, ctx);
+                });
+                self.close_slash_commands_menu(ctx);
             }
             SlashCommandsEvent::SelectedStaticCommand {
                 id,

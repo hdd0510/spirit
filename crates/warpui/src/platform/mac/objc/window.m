@@ -35,6 +35,8 @@ dispatch_once_t fullscreenQueueOnce;
 // This extends the NSWindow API with an implementation of toggleFullScreen
 // that enforces one window transition at a time, preventing concurrent
 // animations.
+BOOL warp_video_owns_event(NSWindow *window, NSEvent *event);
+
 @interface NSWindow (Fullscreen)
 - (void)enqueueFullscreenTransition;
 @end
@@ -368,6 +370,7 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     // being created and positioned under the cursor.
     BOOL _suppressFrameConstraintsDuringDrag;
     BOOL _leftMouseDownStartedInNativeWindowChrome;
+    BOOL _leftMouseDownStartedInVideo;
 }
 
 @synthesize testMode;
@@ -473,10 +476,13 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
             NSButton *windowButton = [self standardWindowButtonAtEvent:event];
             if (windowButton) {
                 _leftMouseDownStartedInNativeWindowChrome = YES;
+                _leftMouseDownStartedInVideo = NO;
                 [super sendEvent:event];
                 break;
             }
             _leftMouseDownStartedInNativeWindowChrome = [self eventIsOverResizeEdge:event];
+            _leftMouseDownStartedInVideo = !_leftMouseDownStartedInNativeWindowChrome &&
+                                           warp_video_owns_event(self, event);
             [super sendEvent:event];
             break;
         }
@@ -490,6 +496,11 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
         // This breaks drag-and-drop for panes and tabs (see CLD-2581), so we work around it with
         // custom dispatching.
         case NSEventTypeLeftMouseUp:
+            if (_leftMouseDownStartedInVideo) {
+                _leftMouseDownStartedInVideo = NO;
+                [super sendEvent:event];
+                break;
+            }
             if (@available(macOS 27, *)) {
                 if (_leftMouseDownStartedInNativeWindowChrome) {
                     [super sendEvent:event];
@@ -502,6 +513,10 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
             _leftMouseDownStartedInNativeWindowChrome = NO;
             break;
         case NSEventTypeLeftMouseDragged:
+            if (_leftMouseDownStartedInVideo) {
+                [super sendEvent:event];
+                break;
+            }
             if (@available(macOS 27, *)) {
                 if (_leftMouseDownStartedInNativeWindowChrome) {
                     [super sendEvent:event];
@@ -518,6 +533,7 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
         // locally, though it is unclear why. This breaks the right-click context menu for tabs on
         // local builds, so we propagate the RightMouseDown event manually.
         case NSEventTypeRightMouseDown:
+            if (warp_video_owns_event(self, event)) break;
             [self.contentView rightMouseDown:event];
             break;
         default:

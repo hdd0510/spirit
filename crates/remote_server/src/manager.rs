@@ -2454,6 +2454,23 @@ impl RemoteServerManager {
             .detach();
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub fn control_sockets_for_host(&self, host_id: &HostId) -> Vec<std::path::PathBuf> {
+        let Some(sessions) = self.host_to_sessions.get(host_id) else {
+            return Vec::new();
+        };
+        sessions
+            .iter()
+            .filter_map(|session_id| match self.sessions.get(session_id) {
+                Some(RemoteSessionState::Connected {
+                    control_path: ControlPath::WarpManaged(path) | ControlPath::UserOwned(path),
+                    ..
+                }) => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Returns the client for this session, if connected.
     pub fn client_for_session(&self, session_id: SessionId) -> Option<&Arc<RemoteServerClient>> {
         match self.sessions.get(&session_id) {
